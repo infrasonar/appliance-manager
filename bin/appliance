@@ -1,0 +1,503 @@
+#!/usr/bin/env python
+import os
+import sys
+import asyncio
+import argparse
+import textwrap
+import signal
+import re
+import yaml
+from configobj import ConfigObj
+from enum import Enum
+from typing import NamedTuple, Optional, Tuple
+from abc import ABC, abstractmethod
+import curses
+import _curses
+from setproctitle import setproctitle
+from aiohttp import ClientSession
+
+
+__version__ = '0.1.0'
+
+
+_FIND_INFRASONAR = 'docker compose ls'
+
+_RE_DOCKER_VERSION = \
+    re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
+_RE_COMPOSE_PATH = \
+    re.compile(r'infrasonar\s+([a-z]+).*\s+(\/.*)docker\-compose\.yml')
+_MIN_DOCKER_VERSION = 24
+
+
+def read_docker_version(output):
+    m = _RE_DOCKER_VERSION.match(output)
+    if not m:
+        return
+    try:
+        major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except Exception:
+        return
+    return major, minor, patch
+
+
+class DockerNotFound(Exception):
+    install_url = 'https://docs.docker.com/engine/install'
+
+
+class DockerNoVersion(Exception):
+    pass
+
+
+class DockerVersionTooOld(Exception):
+    pass
+
+
+class InfraSonarNotRunning(Exception):
+    pass
+
+
+class Step(Enum):
+    Init = 0
+    Main = 1
+
+
+class State:
+    loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+    api_url: str
+    hub_host: str
+    step: Step = Step.Init
+    status: Optional[str] = None
+    compose_path: Optional[str] = None
+    compose_data: Optional[dict] = None
+    agentcore_token: Optional[str] = None
+    agent_token: Optional[str] = None
+    agentcore_zone_id: Optional[int] = None
+
+    @classmethod
+    def read_infrasonar_status(cls, out: str):
+        for line in out.splitlines():
+            m = _RE_COMPOSE_PATH.match(line)
+            if m:
+                cls.status = m.group(1)
+                cls.compose_path = m.group(2)
+                break
+        else:
+            curdir = os.path.realpath(os.path.curdir)
+            for p in (curdir, '/etc/infrasonar'):
+                fn = os.path.join(p, 'docker-compose.yml')
+                if os.path.exists(fn):
+                    try:
+                        with open(fn, 'r') as fp:
+                            data = yaml.safe_load(fp)
+                        assert data['services']['agentcore']
+                    except Exception:
+                        pass
+                    else:
+                        cls.compose_path = p
+                        cls.status = 'not running'
+                        break
+                else:
+                    cls.status = 'not found'
+        if cls.compose_path:
+            fn = os.path.join(cls.compose_path, 'docker-compose.yml')
+            try:
+                with open(fn, 'r') as fp:
+                    compose_data = yaml.safe_load(fp)
+            except Exception as e:
+                msg = str(e) or type(e).__name__
+                cls.status = f'broken compose file ({msg})'
+            else:
+                cls.compose_data = compose_data
+            fn = os.path.join(cls.compose_path, '.env')
+            try:
+                conf = ConfigObj(fn)
+                State.agentcore_token = conf['AGENTCORE_TOKEN']
+                State.agent_token = conf['AGENT_TOKEN']
+                State.agentcore_zone_id = int(conf['AGENTCORE_ZONE_ID'])
+            except Exception as e:
+                msg = str(e) or type(e).__name__
+                cls.status = f'broken .env file ({fn}: {msg})'
+
+
+class Pos(NamedTuple):
+    y: int
+    x: int
+
+
+class MenuItem(NamedTuple):
+    name: str
+    func: callable
+
+
+class Menu:
+    def __init__(self, win, pos: Pos, items: Tuple[Optional[MenuItem]],
+                 horizontal: bool = False):
+        assert isinstance(items[0], MenuItem), 'first must be a MenuItem'
+        assert isinstance(items[-1], MenuItem), 'last must be a MenuItem'
+        self.win = win
+        self.pos = pos
+        self.idx = 0
+        self.items = items
+        self.horizontal = horizontal
+        self.draw()
+
+    def draw(self):
+        for idx, item in enumerate(self.items):
+            if item is None:
+                continue
+            mode = curses.A_REVERSE if idx == self.idx else curses.A_NORMAL
+            if self.horizontal:
+                y = self.pos.y
+                x = self.pos.x + sum([
+                    len(item.name) + 1
+                    for item in self.items[:idx]
+                    if item is not None])
+            else:
+                y, x = self.pos.y+idx, self.pos.x
+            self.win.addstr(y, x, item.name, mode)
+        self.win.refresh()
+
+    def handle_char(self, char: int):
+        if char == curses.KEY_UP or char == curses.KEY_LEFT:
+            self.idx -= 1
+            if self.idx < 0:
+                self.idx = len(self.items)-1
+        elif char == curses.KEY_DOWN or char == curses.KEY_RIGHT:
+            self.idx += 1
+            if self.idx == len(self.items):
+                self.idx = 0
+        elif char == curses.KEY_ENTER or char == 10 or char == 13:
+            self.items[self.idx].func()
+
+        if self.items[self.idx] is None:
+            self.handle_char(char)
+        else:
+            self.draw()
+
+
+class Confirm:
+    def __init__(self, stdscr, msg: str, confirm: callable, cancel: callable):
+        self.stdscr = stdscr
+        self.msg = msg
+        self.confirm = confirm
+        self.cancel = cancel
+        self.draw()
+
+    def draw(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        width = min(maxx - 10, 120)
+        lines = textwrap.wrap(self.msg, width=width-8)
+        h, w = len(lines) + 6, width
+        self.win = self.stdscr.subwin(h, w, maxy//2-h//2, maxx//2-w//2)
+        self.win.bkgd(' ', curses.color_pair(3) | curses.A_BOLD)
+        self.win.erase()
+        self.win.box()
+        for n, s in enumerate(lines):
+            self.win.addstr(n+2, 4, s)
+
+        self.menu = Menu(self.win, Pos(4, 4), (
+            MenuItem(' No ', self.cancel),
+            MenuItem(' Yes ', self.confirm),
+        ), horizontal=True)
+
+
+class Display(ABC):
+    def __init__(self, stdscr: "_curses._CursesWindow"):
+        self.stdscr = stdscr
+        self.confirm: Optional[Confirm] = None
+        self.menu: Optional[Menu] = None
+        self.done: bool = False
+        self._spin: Optional(Pos) = None
+
+    async def _spinner(self):
+        spinner = '◐◓◑◒'  # '▁▂▃▄▅▆▇█▇▆▅▄▃'
+        idx = 0
+        while self._spin:
+            self.stdscr.addstr(
+                self._spin.y,
+                self._spin.x,
+                spinner[idx % len(spinner)])
+            idx += 1
+            await asyncio.sleep(0.1)
+
+    def start_spinner(self, y: int, x: int):
+        self._spin = Pos(y, x)
+        asyncio.ensure_future(self._spinner())
+
+    def stop_spinner(self):
+        self._spin = None
+
+    @abstractmethod
+    def make_display(self) -> None:
+        pass
+
+    @abstractmethod
+    def handle_char(self, char: int) -> None:
+        pass
+
+    def set_exit(self) -> None:
+        self.done = True
+
+    async def run(self) -> None:
+        curses.curs_set(0)
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_RED)
+        curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_CYAN)
+        self.stdscr.nodelay(True)
+        self.stdscr.bkgd(' ', curses.color_pair(1) | curses.A_BOLD)
+        self.make_display()
+
+        while not self.done:
+            char = self.stdscr.getch()
+            if char == curses.ERR:
+                await asyncio.sleep(0.1)
+            elif char == curses.KEY_RESIZE:
+                self.make_display()
+            else:
+                self.handle_char(char)
+
+
+class InfraSonarDisplay(Display):
+
+    def fatal_error(self, msg: str, suggestion: Optional[str] = None):
+        maxy, maxx = self.stdscr.getmaxyx()
+        width = min(maxx - 10, 120)
+        lines = textwrap.wrap(msg, width=width-8)
+        if suggestion:
+            lines.append('')
+            lines.extend(textwrap.wrap(suggestion, width=width-8))
+        lines.append('')
+        lines.append("Press 'q' to quit")
+        h, w = len(lines) + 4, width
+        win = self.stdscr.subwin(h, w, maxy//2-h//2, maxx//2-w//2)
+        win.bkgd(' ', curses.color_pair(2) | curses.A_BOLD)
+        win.erase()
+        win.box()
+        for n, s in enumerate(lines):
+            win.addstr(n+2, 4, s)
+        win.refresh()
+
+    async def check_root(self):
+        y = 6
+        self.stdscr.addstr(y, 4, "Check Root access........................")
+        self.start_spinner(y, 45)
+        try:
+            assert os.geteuid() == 0, \
+                'The InfraSonar appliance tool must run as root!!'
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self.fatal_error(msg, "Please start the tool again as root.")
+        else:
+            self.stdscr.addstr(y, 45, 'OK')
+            await self.check_internet()
+        finally:
+            self.stop_spinner()
+
+    async def check_internet(self):
+        y = 7
+        self.stdscr.addstr(y, 4, "Check Internet connection................")
+        self.start_spinner(y, 45)
+        try:
+            async with ClientSession() as session:
+                async with session.get(State.api_url, ssl=True) as r:
+                    r.raise_for_status()
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            msg = f"Failed to connect to: {State.api_url} (Error: {msg})"
+            self.fatal_error(msg, "Please check your network configuration.")
+        else:
+            self.stdscr.addstr(y, 45, 'OK')
+            await self.check_docker_installation()
+        finally:
+            self.stop_spinner()
+
+    async def check_docker_installation(self):
+        y = 8
+        self.stdscr.addstr(y, 4, "Check Docker installation................")
+        self.start_spinner(y, 45)
+        try:
+            cmd = 'docker -v'
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stderr=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await proc.communicate()
+            out = stdout.decode()
+            err = stderr.decode()
+            if 'not found' in err or 'not found' in out:
+                raise DockerNotFound()
+            if err:
+                raise Exception(err)
+            docker_version = read_docker_version(out)
+            if not docker_version:
+                raise DockerNoVersion()
+            if docker_version[0] < _MIN_DOCKER_VERSION:
+                raise DockerVersionTooOld(
+                    '.'.join([str(i) for i in docker_version]))
+        except DockerNotFound:
+            self.fatal_error(
+                'Docker is not found on your system.',
+                f'Please install docker, see: {DockerNotFound.install_url}')
+        except DockerNoVersion:
+            self.fatal_error('Failed to read the docker version.')
+        except DockerVersionTooOld as e:
+            self.fatal_error(
+                f'Docker version too old: {e}', 'Please upgrade docker.')
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self.fatal_error(f'Unexpected error: {msg}')
+        else:
+            self.stdscr.addstr(y, 45, 'OK')
+            await self.check_infrasonar_installation()
+        finally:
+            self.stop_spinner()
+
+    async def check_infrasonar_installation(self):
+        y = 9
+        self.stdscr.addstr(y, 4, "Check InfraSonar appliance status........")
+        self.start_spinner(y, 45)
+        try:
+            cmd = 'docker compose ls'
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stderr=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await proc.communicate()
+            out = stdout.decode()
+            err = stderr.decode()
+            if err:
+                raise Exception(err)
+            State.read_infrasonar_status(out)
+            if State.status != 'running':
+                raise InfraSonarNotRunning()
+        except InfraSonarNotRunning:
+            self.fatal_error(f'InfraSonar status: {State.status}')
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self.fatal_error(f'Unexpected error: {msg}')
+        else:
+            self.stdscr.addstr(y, 45, 'OK')
+            await asyncio.sleep(0.2)
+            self.to_main()
+
+        finally:
+            self.stop_spinner()
+
+    async def test_panel(self):
+        panel = curses.panel.new_panel(self.stdscr)
+
+    def to_main(self):
+        if self.confirm:
+            self.confirm: Optional[Confirm] = None
+        State.step = Step.Main
+        asyncio.ensure_future(self.async_make_display())
+
+    async def async_make_display(self):
+        self.make_display()
+
+    def on_exit_without_saving(self):
+        self.confirm = Confirm(
+            self.stdscr,
+            'Do you want to quit without saving?',
+            self.set_exit,
+            self.to_main)
+
+    def on_init(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        self.stdscr.addstr(maxy - 2, maxx - 20, "Press 'q' to quit")
+        self.stdscr.refresh()
+
+        for signame in ('SIGINT', 'SIGTERM'):
+            State.loop.add_signal_handler(
+                getattr(signal, signame), self.set_exit)
+
+        asyncio.ensure_future(self.check_root())
+
+    def on_main(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        msg = f"InfraSonar status: {State.status}"
+        self.stdscr.addstr(maxy - 2, maxx - len(msg) - 2, msg)
+        self.stdscr.refresh()
+
+        if self.menu:
+            self.menu.draw()
+        else:
+            self.menu = Menu(self.stdscr, Pos(6, 4), (
+                MenuItem('Change agentcore token  ', lambda: None),
+                MenuItem('Change agent token      ', lambda: None),
+                MenuItem('Change zone             ', lambda: None),
+                None,
+                MenuItem('Exit                    ', self.on_exit_without_saving),
+            ), horizontal=False)
+
+        if self.confirm:
+            self.confirm.draw()
+
+    def make_display(self) -> None:
+        self.stdscr.erase()
+        self.stdscr.addstr(1, 1, r"""    ___       __          ___
+    |_ _|_ _  / _|_ _ __ _/ __| ___ _ _  __ _ _ _
+     | || ' \|  _| '_/ _` \__ \/ _ \ ' \/ _` | '_|
+    |___|_||_|_| |_| \__,_|___/\___/_||_\__,_|_|
+""")
+
+        self.stdscr.box()
+
+        if State.step is Step.Init:
+            self.on_init()
+        elif State.step is Step.Main:
+            self.on_main()
+
+    def handle_char(self, char: int) -> None:
+        if self.confirm:
+            self.confirm.menu.handle_char(char)
+        elif State.step is Step.Init:
+            if chr(char) == "q":
+                self.set_exit()
+        elif State.step is Step.Main:
+            self.menu.handle_char(char)
+
+
+async def display_main(stdscr):
+    disp = InfraSonarDisplay(stdscr)
+    await disp.run()
+
+
+def main(stdscr) -> None:
+    loop = asyncio.get_event_loop()
+    # add signal handlers
+    return State.loop.run_until_complete(display_main(stdscr))
+
+
+if __name__ == "__main__":
+    setproctitle('appliance-toolkit')
+
+    parser = argparse.ArgumentParser(prog='appliance-toolkit')
+    parser.add_argument(
+        '--version', '-v',
+        action='store_true',
+        help='Show version and exit')
+    parser.add_argument(
+        '--development',
+        action='store_true',
+        help='Use the InfraSonar development environment')
+
+    args = parser.parse_args()
+
+    if args.version:
+        print(f'InfraSonar appliance toolkit version {__version__}')
+        sys.exit(0)
+
+    if args.development:
+        State.api_url = 'https://devapi.infrasonar.com'
+        State.hub_host = 'devhub.infrasonar.com'
+    else:
+        State.api_url = 'https://api.infrasonar.com'
+        State.hub_host = 'hub.infrasonar.com'
+
+    curses.wrapper(main)
