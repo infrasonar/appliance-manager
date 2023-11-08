@@ -39,6 +39,8 @@ def read_docker_version(output):
         return
     return major, minor, patch
 
+TOKEN_CHARS = set([ord(c) for c in '0123456789abcdef'])
+TOKEN_LEN = 32
 
 class DockerNotFound(Exception):
     install_url = 'https://docs.docker.com/engine/install'
@@ -59,10 +61,13 @@ class InfraSonarNotRunning(Exception):
 class Step(Enum):
     Init = 0
     Main = 1
+    Apply = 2
 
 
 class State:
     loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+    probes_config_meta_url: str = \
+        'https://github.com/infrasonar/manage-/blob/main/probes-config-meta.yml'
     api_url: str
     hub_host: str
     step: Step = Step.Init
@@ -72,6 +77,28 @@ class State:
     agentcore_token: Optional[str] = None
     agent_token: Optional[str] = None
     agentcore_zone_id: Optional[int] = None
+
+    @classmethod
+    def write(cls):
+        try:
+            fn = os.path.join(cls.compose_path, '.env')
+            conf = ConfigObj()
+            conf.filename = fn
+            conf['AGENTCORE_TOKEN'] = cls.agentcore_token
+            conf['AGENT_TOKEN'] = cls.agent_token
+            conf['AGENTCORE_ZONE_ID'] = cls.agentcore_zone_id
+            conf.write()
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            raise Exception(f'failed to write {fn} ({msg})')
+
+        try:
+            fn = os.path.join(cls.compose_path, 'docker-compose.yml')
+            with open(fn, 'w') as fp:
+                yaml.safe_dump(cls.compose_data, fp)
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            raise Exception(f'failed to write {fn} ({msg})')
 
     @classmethod
     def read_infrasonar_status(cls, out: str):
@@ -111,12 +138,19 @@ class State:
             fn = os.path.join(cls.compose_path, '.env')
             try:
                 conf = ConfigObj(fn)
-                State.agentcore_token = conf['AGENTCORE_TOKEN']
-                State.agent_token = conf['AGENT_TOKEN']
-                State.agentcore_zone_id = int(conf['AGENTCORE_ZONE_ID'])
+                cls.agentcore_token = conf['AGENTCORE_TOKEN']
+                cls.agent_token = conf['AGENT_TOKEN']
+                cls.agentcore_zone_id = int(conf['AGENTCORE_ZONE_ID'])
             except Exception as e:
                 msg = str(e) or type(e).__name__
                 cls.status = f'broken .env file ({fn}: {msg})'
+
+    @classmethod
+    async def read_probes_config_meta(cls):
+        try:
+            async with ClientSession() as session:
+                async with session.get(State.api_url, ssl=True) as r:
+                    r.raise_for_status()
 
 
 class Pos(NamedTuple):
@@ -162,7 +196,7 @@ class Menu:
             self.idx -= 1
             if self.idx < 0:
                 self.idx = len(self.items)-1
-        elif char == curses.KEY_DOWN or char == curses.KEY_RIGHT:
+        elif char == curses.KEY_DOWN or char == curses.KEY_RIGHT or char == 9:
             self.idx += 1
             if self.idx == len(self.items):
                 self.idx = 0
@@ -174,6 +208,88 @@ class Menu:
         else:
             self.draw()
 
+
+class Input:
+    def __init__(self, pos: Pos, text: str):
+        self.pos = pos
+        self.text = text
+
+    def draw(self):
+        pass
+
+
+class TokenDialog:
+    def __init__(self, stdscr, title: str, token: str,
+                 confirm: callable, cancel: callable):
+        self.stdscr = stdscr
+        self.title = title
+        self.hide = True
+        self.token = token
+        self.curs_x = len(self.token)
+        self.confirm = confirm
+        self.cancel = cancel
+        self.draw()
+
+    async def set_cursor(self):
+        curses.setsyx(self.wpos.y + 4, self.wpos.x + 2 + self.curs_x)
+        curses.doupdate()
+
+    def draw(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        h, w = 9, 60
+
+        curses.curs_set(2)
+
+        self.wpos = Pos(maxy//2-h//2, maxx//2-w//2)
+        self.win = self.stdscr.subwin(h, w, self.wpos.y, self.wpos.x)
+        self.win.bkgd(' ', curses.color_pair(3) | curses.A_BOLD)
+        self.win.erase()
+        self.win.box()
+        self.win.addstr(2, 2, self.title)
+        self.win.addstr(7, 22, '(CTRL+h to show/hide, ESC to cancel)')
+
+        tokenstr = '*' * len(self.token) if self.hide else self.token
+        tokenstr = tokenstr.ljust(40)
+        self.win.addstr(4, 2, tokenstr, curses.A_REVERSE)
+        self.win.refresh()
+        asyncio.ensure_future(self.set_cursor())
+
+    def handle_char(self, char: int):
+        if char == curses.KEY_LEFT:
+            if self.curs_x:
+                self.curs_x -= 1
+        elif char == curses.KEY_RIGHT:
+            if self.curs_x < len(self.token):
+                self.curs_x += 1
+        elif char == curses.KEY_HOME:
+            self.curs_x = 0
+        elif char == curses.KEY_END:
+            self.curs_x = len(self.token)
+        elif char == 263:  # CTRL+h
+            self.hide = not self.hide
+        elif char in TOKEN_CHARS:
+            if len(self.token) < TOKEN_LEN:
+                self.token = (
+                    self.token[:self.curs_x] +
+                    chr(char) +
+                    self.token[self.curs_x:])
+                self.curs_x += 1
+        elif char == curses.KEY_BACKSPACE or char == 127:
+            if self.curs_x:
+                self.token = \
+                    self.token[:self.curs_x-1] + self.token[self.curs_x:]
+                self.curs_x -= 1
+        elif char == 330:  # DELETE
+            self.token = \
+                    self.token[:self.curs_x] + self.token[self.curs_x+1:]
+        elif char == curses.KEY_ENTER or char == 10 or char == 13:
+            if len(self.token) == TOKEN_LEN:
+                self.confirm(self.token)
+                return
+        elif char == 27:  # ESCAPE
+            self.cancel()
+            return
+        self.draw()
 
 class Confirm:
     def __init__(self, stdscr, msg: str, confirm: callable, cancel: callable):
@@ -201,12 +317,42 @@ class Confirm:
         ), horizontal=True)
 
 
-class Display(ABC):
+class Fatal:
+    def __init__(self, stdscr, msg: str, suggestion: Optional[str] = None):
+        self.stdscr = stdscr
+        self.msg = msg
+        self.suggestion = suggestion
+        self.draw()
+
+    def draw(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        width = min(maxx - 10, 120)
+        lines = textwrap.wrap(self.msg, width=width-8)
+        if self.suggestion:
+            lines.append('')
+            lines.extend(textwrap.wrap(self.suggestion, width=width-8))
+        lines.append('')
+        lines.append("Press 'q' to quit")
+        h, w = len(lines) + 4, width
+        win = self.stdscr.subwin(h, w, maxy//2-h//2, maxx//2-w//2)
+        win.bkgd(' ', curses.color_pair(2) | curses.A_BOLD)
+        win.erase()
+        win.box()
+        for n, s in enumerate(lines):
+            win.addstr(n+2, 4, s)
+        win.refresh()
+
+
+class InfraSonarDisplay:
     def __init__(self, stdscr: "_curses._CursesWindow"):
         self.stdscr = stdscr
         self.confirm: Optional[Confirm] = None
+        self.token_dialog: Optional[TokenDialog] = None
+        self.fatal: Optional[Fatal] = None
         self.menu: Optional[Menu] = None
+        self.apply_step = 1
         self.done: bool = False
+        self.has_changes = False
         self._spin: Optional(Pos) = None
 
     async def _spinner(self):
@@ -221,19 +367,13 @@ class Display(ABC):
             await asyncio.sleep(0.1)
 
     def start_spinner(self, y: int, x: int):
+        disabled = self._spin is None
         self._spin = Pos(y, x)
-        asyncio.ensure_future(self._spinner())
+        if disabled:
+            asyncio.ensure_future(self._spinner())
 
     def stop_spinner(self):
         self._spin = None
-
-    @abstractmethod
-    def make_display(self) -> None:
-        pass
-
-    @abstractmethod
-    def handle_char(self, char: int) -> None:
-        pass
 
     def set_exit(self) -> None:
         self.done = True
@@ -256,26 +396,8 @@ class Display(ABC):
             else:
                 self.handle_char(char)
 
-
-class InfraSonarDisplay(Display):
-
     def fatal_error(self, msg: str, suggestion: Optional[str] = None):
-        maxy, maxx = self.stdscr.getmaxyx()
-        width = min(maxx - 10, 120)
-        lines = textwrap.wrap(msg, width=width-8)
-        if suggestion:
-            lines.append('')
-            lines.extend(textwrap.wrap(suggestion, width=width-8))
-        lines.append('')
-        lines.append("Press 'q' to quit")
-        h, w = len(lines) + 4, width
-        win = self.stdscr.subwin(h, w, maxy//2-h//2, maxx//2-w//2)
-        win.bkgd(' ', curses.color_pair(2) | curses.A_BOLD)
-        win.erase()
-        win.box()
-        for n, s in enumerate(lines):
-            win.addstr(n+2, 4, s)
-        win.refresh()
+        self.fatal = Fatal(self.stdscr, msg, suggestion)
 
     async def check_root(self):
         y = 6
@@ -391,9 +513,25 @@ class InfraSonarDisplay(Display):
     async def test_panel(self):
         panel = curses.panel.new_panel(self.stdscr)
 
+    def set_agentcore_token(self, token):
+        if token != State.agentcore_token:
+            State.agentcore_token = token
+            self.has_changes = True
+            self.menu = None
+        self.to_main()
+
+    def set_agent_token(self, token):
+        if token != State.agent_token:
+            State.agent_token = token
+            self.has_changes = True
+            self.menu = None
+        self.to_main()
+
     def to_main(self):
-        if self.confirm:
-            self.confirm: Optional[Confirm] = None
+        self.confirm: Optional[Confirm] = None
+        self.token_dialog: Optional[TokenDialog] = None
+        self.apply_step = None
+        curses.curs_set(0)
         State.step = Step.Main
         asyncio.ensure_future(self.async_make_display())
 
@@ -407,16 +545,114 @@ class InfraSonarDisplay(Display):
             self.set_exit,
             self.to_main)
 
+    def on_change_agentcore_token(self):
+        self.token_dialog = TokenDialog(
+            self.stdscr,
+            'Agentcore token',
+            State.agentcore_token,
+            self.set_agentcore_token,
+            self.to_main)
+
+    def on_change_agent_token(self):
+        self.token_dialog = TokenDialog(
+            self.stdscr,
+            'Agent token',
+            State.agent_token,
+            self.set_agent_token,
+            self.to_main)
+
+    def on_change_zone(self):
+
+    async def write_to_disk(self):
+        try:
+            State.write()
+        except Exception as e:
+            return self.fatal_error(str(e))
+        await asyncio.sleep(0.3)
+        self.apply_step += 1
+        self.draw_apply()
+        await self.docker_compose_pull()
+
+    async def docker_compose_pull(self):
+        try:
+            cmd = 'docker compose pull'
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stderr=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await proc.communicate()
+            out = stdout.decode()
+            err = stderr.decode()
+        except Exception as e:
+            return self.fatal_error(str(e))
+        self.apply_step += 1
+        self.draw_apply()
+        await self.docker_compose_up()
+
+    async def docker_compose_up(self):
+        try:
+            cmd = 'docker compose up -d'
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stderr=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await proc.communicate()
+            out = stdout.decode()
+            err = stderr.decode()
+        except Exception as e:
+            return self.fatal_error(str(e))
+        self.apply_step += 1
+        self.draw_apply()
+
+    def save_and_apply_changes(self):
+        self.apply_step = 1
+        State.step = Step.Apply
+        self.menu: Optional[Menu] = None
+        asyncio.ensure_future(self.async_make_display())
+        asyncio.ensure_future(self.write_to_disk())
+
+    def draw_apply(self):
+        y, x = 7, 33
+        self.stdscr.addstr(
+            y, 4, "(Each step might take several minutes, please be patient!)")
+
+        y += 2
+        self.stdscr.addstr(y, 4, "write changes to disk........")
+        if self.apply_step > 1:
+            self.stdscr.addstr(y, x, "OK")
+            y += 1
+            self.stdscr.addstr(y, 4, "docker compose pull..........")
+        if self.apply_step > 2:
+            self.stdscr.addstr(y, x, "OK")
+            y += 1
+            self.stdscr.addstr(y, 4, "docker compose up............")
+
+        if self.apply_step > 3:
+            self.stdscr.addstr(y, x, "OK")
+            y += 2
+            self.stdscr.addstr(y, 4, "Done! (press any key to continue)")
+            self.stop_spinner()
+            self.has_changes = False
+        else:
+            self.start_spinner(y, x)
+
     def on_init(self):
         maxy, maxx = self.stdscr.getmaxyx()
         self.stdscr.addstr(maxy - 2, maxx - 20, "Press 'q' to quit")
         self.stdscr.refresh()
 
-        for signame in ('SIGINT', 'SIGTERM'):
-            State.loop.add_signal_handler(
-                getattr(signal, signame), self.set_exit)
+        if self.fatal:
+            self.fatal.draw()
+        else:
+            for signame in ('SIGINT', 'SIGTERM'):
+                State.loop.add_signal_handler(
+                    getattr(signal, signame), self.set_exit)
 
-        asyncio.ensure_future(self.check_root())
+            asyncio.ensure_future(self.check_root())
 
     def on_main(self):
         maxy, maxx = self.stdscr.getmaxyx()
@@ -427,16 +663,38 @@ class InfraSonarDisplay(Display):
         if self.menu:
             self.menu.draw()
         else:
-            self.menu = Menu(self.stdscr, Pos(6, 4), (
-                MenuItem('Change agentcore token  ', lambda: None),
-                MenuItem('Change agent token      ', lambda: None),
+            items = [
+                MenuItem(
+                    'Change agentcore token  ',
+                    self.on_change_agentcore_token),
+                MenuItem(
+                    'Change agent token      ',
+                    self.on_change_agent_token),
                 MenuItem('Change zone             ', lambda: None),
                 None,
-                MenuItem('Exit                    ', self.on_exit_without_saving),
-            ), horizontal=False)
+            ]
+            if self.has_changes:
+                items.extend([
+                    MenuItem(
+                        'Save and apply changes  ',
+                        self.save_and_apply_changes),
+                    MenuItem(
+                        'Exit without saving     ',
+                        self.on_exit_without_saving),
+                ])
+            else:
+                items.append(
+                    MenuItem('Exit                    ', self.set_exit)
+                )
+
+
+            self.menu = Menu(self.stdscr, Pos(6, 4), items, horizontal=False)
 
         if self.confirm:
             self.confirm.draw()
+
+        if self.token_dialog:
+            self.token_dialog.draw()
 
     def make_display(self) -> None:
         self.stdscr.erase()
@@ -452,13 +710,20 @@ class InfraSonarDisplay(Display):
             self.on_init()
         elif State.step is Step.Main:
             self.on_main()
+        elif State.step is Step.Apply:
+            self.draw_apply()
 
     def handle_char(self, char: int) -> None:
-        if self.confirm:
+        if self.token_dialog:
+            self.token_dialog.handle_char(char)
+        elif self.confirm:
             self.confirm.menu.handle_char(char)
-        elif State.step is Step.Init:
-            if chr(char) == "q":
+        elif State.step is Step.Init or (
+                State.step is Step.Apply and self.fatal):
+            if chr(char) == 'q':
                 self.set_exit()
+        elif State.step is Step.Apply and self.apply_step > 3:
+            self.to_main()
         elif State.step is Step.Main:
             self.menu.handle_char(char)
 
