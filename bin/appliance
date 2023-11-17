@@ -7,26 +7,86 @@ import textwrap
 import signal
 import re
 import yaml
+import string
+from abc import abstractmethod
 from configobj import ConfigObj
 from enum import Enum
-from typing import NamedTuple, Optional, Tuple
-from abc import ABC, abstractmethod
+from typing import NamedTuple, Optional, Tuple, List, Any
 import curses
 import _curses
+import functools
 from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
 __version__ = '0.1.0'
 
-
-_FIND_INFRASONAR = 'docker compose ls'
-
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
 _RE_COMPOSE_PATH = \
     re.compile(r'infrasonar\s+([a-z]+).*\s+(\/.*)docker\-compose\.yml')
 _MIN_DOCKER_VERSION = 24
+
+_WATCH_TOWER = {
+    'environment': {
+        'WATCHTOWER_CLEANUP': True,
+        'WATCHTOWER_INCLUDE_RESTARTING': True,
+        'WATCHTOWER_POLL_INTERVAL': 21600,
+        'WATCHTOWER_SCOPE': '${AGENTCORE_TOKEN}'
+    },
+    'image': 'containrrr/watchtower',
+    'volumes': [
+        '/var/run/docker.sock:/var/run/docker.sock',
+        '/etc/localtime:/etc/localtime:ro'
+    ]
+}
+
+_X_INFRASONAR_TEMPLATE = {
+    'labels': {'com.centurylinklabs.watchtower.scope': '${AGENTCORE_TOKEN}'},
+    'logging': {'options': {'max-size': '5m'}},
+    'network_mode': 'host',
+    'restart': 'always',
+    'volumes': ['./data:/data/']
+}
+
+_AGENTCORE = {
+    'environment': {
+        'AGENTCORE_ZONE': '${AGENTCORE_ZONE_ID}',
+        'HUB_HOST': '<HUB_HOST>',
+        'TOKEN': '${AGENTCORE_TOKEN}'
+    },
+    'image': 'ghcr.io/infrasonar/agentcore'
+}
+
+_DOCKER_AGENT = {
+    'environment': {
+        'TOKEN': '${AGENT_TOKEN}',
+        'API_URI': '<API_URL>'
+    },
+    'image': 'ghcr.io/infrasonar/docker-agent',
+    'volumes': [
+        '/var/run/docker.sock:/var/run/docker.sock',
+        './data:/data/'
+    ]
+}
+
+_SPEEDTEST_AGENT = {
+    'environment': {
+        'TOKEN': '${AGENT_TOKEN}',
+        'API_URI': '<API_URL>'
+    },
+    'image': 'ghcr.io/infrasonar/speedtest-agent'
+}
+
+_PROBE_IMAGE = 'ghcr.io/infrasonar/{collector_key}-probe'
+
+
+def eq(left, right):
+    return left == right
+
+
+def ne(left, right):
+    return left != right
 
 
 def read_docker_version(output):
@@ -39,6 +99,8 @@ def read_docker_version(output):
         return
     return major, minor, patch
 
+
+PRINTABLE_CHARS = set([ord(c) for c in string.printable])
 TOKEN_CHARS = set([ord(c) for c in '0123456789abcdef'])
 TOKEN_LEN = 32
 
@@ -58,25 +120,78 @@ class InfraSonarNotRunning(Exception):
     pass
 
 
+class InfraSonarWrongEnv(Exception):
+    pass
+
+
 class Step(Enum):
     Init = 0
     Main = 1
     Apply = 2
+    ManageProbes = 3
+    Synchronize = 4
+    ManageProbe = 5
+
+
+class Part(Enum):
+    Environment = 'environment'
+    Config = 'config'
 
 
 class State:
     loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
-    probes_config_meta_url: str = \
-        'https://github.com/infrasonar/manage-/blob/main/probes-config-meta.yml'
+    probes_config_meta: Optional[dict] = None
     api_url: str
     hub_host: str
     step: Step = Step.Init
     status: Optional[str] = None
     compose_path: Optional[str] = None
     compose_data: Optional[dict] = None
+    config_data: Optional[dict] = None
     agentcore_token: Optional[str] = None
     agent_token: Optional[str] = None
     agentcore_zone_id: Optional[int] = None
+    container_id: Optional[int] = None
+    has_changes: bool = False
+
+    @classmethod
+    def headers(cls):
+        return {'Authorization': f'Bearer {cls.agent_token}'}
+
+    @classmethod
+    async def read_container_id(cls):
+        if cls.container_id is not None:
+            return
+        url = f'{State.api_url}/container/id'
+        async with ClientSession(headers=cls.headers()) as session:
+            async with session.get(url, ssl=True) as r:
+                if r.status != 200:
+                    msg = await r.text()
+                    raise Exception(f'{msg} (error code: {r.status})')
+                resp = await r.json()
+                cls.container_id = resp['containerId']
+
+    @classmethod
+    async def refresh_enbled_probes(cls):
+        await cls.read_container_id()
+        params = 'fields=key,kind'
+        url = f'{cls.api_url}/container/{cls.container_id}/collectors?{params}'
+        async with ClientSession(headers=cls.headers()) as session:
+            async with session.get(url, ssl=True) as r:
+                if r.status != 200:
+                    msg = await r.text()
+                    raise Exception(f'{msg} (error code: {r.status})')
+                resp = await r.json()
+                probes = set(c['key'] for c in resp if c['kind'] == 'probe')
+                current = set(cls.get_probes())
+                for probe in current-probes:
+                    del cls.compose_data['services'][f'{probe}-probe']
+                    cls.has_changes = True
+                for probe in probes-current:
+                    p = cls.compose_data['x-infrasonar-template'].copy()
+                    p['image'] = f'ghcr.io/infrasonar/{probe}-probe'
+                    cls.compose_data['services'][f'{probe}-probe'] = p
+                    cls.has_changes = True
 
     @classmethod
     def write(cls):
@@ -100,6 +215,18 @@ class State:
             msg = str(e) or type(e).__name__
             raise Exception(f'failed to write {fn} ({msg})')
 
+        try:
+            fn = os.path.join(
+                cls.compose_path,
+                'data',
+                'config',
+                'infrasonar.yaml')
+            with open(fn, 'w') as fp:
+                yaml.safe_dump(cls.config_data, fp)
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            raise Exception(f'failed to write {fn} ({msg})')
+
     @classmethod
     def read_infrasonar_status(cls, out: str):
         for line in out.splitlines():
@@ -117,6 +244,7 @@ class State:
                         with open(fn, 'r') as fp:
                             data = yaml.safe_load(fp)
                         assert data['services']['agentcore']
+                        assert data['x-infrasonar-template']
                     except Exception:
                         pass
                     else:
@@ -133,6 +261,7 @@ class State:
             except Exception as e:
                 msg = str(e) or type(e).__name__
                 cls.status = f'broken compose file ({msg})'
+                return
             else:
                 cls.compose_data = compose_data
             fn = os.path.join(cls.compose_path, '.env')
@@ -141,16 +270,55 @@ class State:
                 cls.agentcore_token = conf['AGENTCORE_TOKEN']
                 cls.agent_token = conf['AGENT_TOKEN']
                 cls.agentcore_zone_id = int(conf['AGENTCORE_ZONE_ID'])
+
             except Exception as e:
                 msg = str(e) or type(e).__name__
                 cls.status = f'broken .env file ({fn}: {msg})'
+                return
+            fn = os.path.join(
+                cls.compose_path,
+                'data',
+                'config',
+                'infrasonar.yaml')
+            try:
+                with open(fn, 'r') as fp:
+                    cls.config_data = yaml.safe_load(fp)
+                    assert isinstance(cls.config_data, dict)
+            except Exception:
+                cls.config_data = {}  # file is not required to exist
 
     @classmethod
     async def read_probes_config_meta(cls):
-        try:
-            async with ClientSession() as session:
-                async with session.get(State.api_url, ssl=True) as r:
-                    r.raise_for_status()
+        url = f'{cls.api_url}/probes-config-meta.yml'
+        async with ClientSession() as session:
+            async with session.get(url, ssl=True) as r:
+                r.raise_for_status()
+                raw = await r.read()
+
+        cls.probes_config_meta = yaml.safe_load(raw)
+
+    @classmethod
+    def get_probes(cls) -> List[str]:
+        return sorted(
+            key[:-6]
+            for key in cls.compose_data['services'].keys()
+            if key.endswith('-probe'))
+
+    @classmethod
+    def get_config_value(cls, keys: List[str], dval: Optional[Any] = None):
+        d = cls.config_data
+        for k in keys:
+            if k is None:
+                continue  # ignore None values in key
+            if isinstance(d, dict):
+                d = d.get(k)
+        return dval if d is None else d
+
+    @classmethod
+    def get_env_var(cls, probe: str, key: str,
+                    dval: Optional[Any] = None) -> str:
+        services = State.compose_data['services']
+        return services.get(probe, {}).get('environment', {}).get(key, dval)
 
 
 class Pos(NamedTuple):
@@ -165,21 +333,32 @@ class MenuItem(NamedTuple):
 
 class Menu:
     def __init__(self, win, pos: Pos, items: Tuple[Optional[MenuItem]],
-                 horizontal: bool = False):
+                 horizontal: bool = False, ljust: Optional[int] = None,
+                 idx: Optional[int] = None):
         assert isinstance(items[0], MenuItem), 'first must be a MenuItem'
         assert isinstance(items[-1], MenuItem), 'last must be a MenuItem'
         self.win = win
         self.pos = pos
-        self.idx = 0
+        self.idx = max(min(idx or 0, len(items)), 0)
         self.items = items
         self.horizontal = horizontal
+        self.pad = ljust
         self.draw()
 
     def draw(self):
-        for idx, item in enumerate(self.items):
+        maxy, _maxx = self.win.getmaxyx()
+
+        # not perfect for horizontal but we can ignore this
+        m = maxy-self.pos.y-1
+        s = max(self.idx-m+1, 0)
+        items = self.items[s:s+m]
+
+        for idx, item in enumerate(items):
             if item is None:
+                if self.horizontal is False and self.pad is not None:
+                    self.win.addstr(self.pos.y+idx, self.pos.x, ' '*self.pad)
                 continue
-            mode = curses.A_REVERSE if idx == self.idx else curses.A_NORMAL
+            mode = curses.A_REVERSE if idx+s == self.idx else curses.A_NORMAL
             if self.horizontal:
                 y = self.pos.y
                 x = self.pos.x + sum([
@@ -188,10 +367,14 @@ class Menu:
                     if item is not None])
             else:
                 y, x = self.pos.y+idx, self.pos.x
-            self.win.addstr(y, x, item.name, mode)
+            k = item.name if self.pad is None else item.name.ljust(self.pad)
+
+            self.win.addstr(y, x, k, mode)
         self.win.refresh()
 
     def handle_char(self, char: int):
+        if char == 27:
+            self.items[-1].func()
         if char == curses.KEY_UP or char == curses.KEY_LEFT:
             self.idx -= 1
             if self.idx < 0:
@@ -202,6 +385,7 @@ class Menu:
                 self.idx = 0
         elif char == curses.KEY_ENTER or char == 10 or char == 13:
             self.items[self.idx].func()
+            return
 
         if self.items[self.idx] is None:
             self.handle_char(char)
@@ -210,33 +394,42 @@ class Menu:
 
 
 class Input:
-    def __init__(self, pos: Pos, text: str):
-        self.pos = pos
-        self.text = text
+    def __init__(self, stdscr, title: str, confirm: callable,
+                 cancel: callable):
+        self.stdscr = stdscr
+        self.title = title
+        self.confirm = confirm
+        self.cancel = cancel
 
+    @abstractmethod
     def draw(self):
         pass
 
+    @abstractmethod
+    def handle_char(self, char: int):
+        pass
 
-class TokenDialog:
-    def __init__(self, stdscr, title: str, token: str,
-                 confirm: callable, cancel: callable):
-        self.stdscr = stdscr
-        self.title = title
-        self.hide = True
-        self.token = token
-        self.curs_x = len(self.token)
-        self.confirm = confirm
-        self.cancel = cancel
-        self.draw()
 
-    async def set_cursor(self):
+class InputStr(Input):
+    def __init__(self, stdscr, title: str, confirm: callable, cancel: callable,
+                 validate: callable, text: str, charset: set,
+                 max_len: int = 60, secret: bool = False):
+        super().__init__(stdscr, title, confirm, cancel)
+        self.secret = secret
+        self.hide = secret
+        self.text = text
+        self.curs_x = len(self.text)
+        self.validate = validate
+        self.charset = charset
+        self.max_len = max_len
+
+    async def _set_cursor(self):
         curses.setsyx(self.wpos.y + 4, self.wpos.x + 2 + self.curs_x)
         curses.doupdate()
 
     def draw(self):
         maxy, maxx = self.stdscr.getmaxyx()
-        h, w = 9, 60
+        h, w = 9, 65
 
         curses.curs_set(2)
 
@@ -246,50 +439,202 @@ class TokenDialog:
         self.win.erase()
         self.win.box()
         self.win.addstr(2, 2, self.title)
-        self.win.addstr(7, 22, '(CTRL+h to show/hide, ESC to cancel)')
 
-        tokenstr = '*' * len(self.token) if self.hide else self.token
-        tokenstr = tokenstr.ljust(40)
-        self.win.addstr(4, 2, tokenstr, curses.A_REVERSE)
+        enter = ', ENTER to confirm' if self.validate(self.text) else ''
+        secret = 'CTRL+h to show/hide, ' if self.secret else ''
+        msg = f'({secret}ESC to cancel{enter})'
+        self.win.addstr(7, 63 - len(msg), msg)
+
+        textstr = '*' * len(self.text) if self.hide else self.text
+        textstr = textstr.ljust(min(self.max_len+10, 61))
+        self.win.addstr(4, 2, textstr, curses.A_REVERSE)
         self.win.refresh()
-        asyncio.ensure_future(self.set_cursor())
+
+        asyncio.ensure_future(self._set_cursor())
 
     def handle_char(self, char: int):
         if char == curses.KEY_LEFT:
             if self.curs_x:
                 self.curs_x -= 1
         elif char == curses.KEY_RIGHT:
-            if self.curs_x < len(self.token):
+            if self.curs_x < len(self.text):
                 self.curs_x += 1
         elif char == curses.KEY_HOME:
             self.curs_x = 0
         elif char == curses.KEY_END:
-            self.curs_x = len(self.token)
-        elif char == 263:  # CTRL+h
+            self.curs_x = len(self.text)
+        elif char == 263 and self.secret:  # CTRL+h
             self.hide = not self.hide
-        elif char in TOKEN_CHARS:
-            if len(self.token) < TOKEN_LEN:
-                self.token = (
-                    self.token[:self.curs_x] +
-                    chr(char) +
-                    self.token[self.curs_x:])
-                self.curs_x += 1
         elif char == curses.KEY_BACKSPACE or char == 127:
             if self.curs_x:
-                self.token = \
-                    self.token[:self.curs_x-1] + self.token[self.curs_x:]
+                self.text = \
+                    self.text[:self.curs_x-1] + self.text[self.curs_x:]
                 self.curs_x -= 1
         elif char == 330:  # DELETE
-            self.token = \
-                    self.token[:self.curs_x] + self.token[self.curs_x+1:]
+            self.text = self.text[:self.curs_x] + self.text[self.curs_x+1:]
         elif char == curses.KEY_ENTER or char == 10 or char == 13:
-            if len(self.token) == TOKEN_LEN:
-                self.confirm(self.token)
+            if self.validate(self.text):
+                self.confirm(self.text)
                 return
         elif char == 27:  # ESCAPE
             self.cancel()
             return
+        elif char in self.charset:
+            if len(self.text) < self.max_len:
+                self.text = (
+                    self.text[:self.curs_x] +
+                    chr(char) +
+                    self.text[self.curs_x:])
+                self.curs_x += 1
         self.draw()
+
+class InputInt(Input):
+
+    def __init__(self, stdscr, title: str, confirm: callable, cancel: callable,
+                 number: int, mi: int, ma: int):
+        super().__init__(stdscr, title, confirm, cancel)
+        self.number = number
+        self.mi = mi
+        self.ma = ma
+
+    def draw(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        h, w = 9, 65
+
+        self.wpos = Pos(maxy//2-h//2, maxx//2-w//2)
+        self.win = self.stdscr.subwin(h, w, self.wpos.y, self.wpos.x)
+        self.win.bkgd(' ', curses.color_pair(3) | curses.A_BOLD)
+        self.win.erase()
+        self.win.box()
+        self.win.addstr(2, 2, self.title)
+
+        msg = \
+            '(Up/Down+-1, PgUp/Down+-10, ' \
+            'ENTER to confirm, ESC to Cancel)'
+
+        self.win.addstr(7, 63 - len(msg), msg)
+
+        numberstr = str(self.number).rjust(6)
+        self.win.addstr(4, 2, numberstr, curses.A_REVERSE)
+        self.win.refresh()
+
+    def handle_char(self, char: int):
+        if char == curses.KEY_UP:
+            if self.number < self.ma:
+                self.number += 1
+        elif char == curses.KEY_DOWN:
+            if self.number > self.mi:
+                self.number -= 1
+        elif char == 339:  # PgUp
+            self.number += 10
+            self.number = min(self.ma, self.number)
+        elif char == 338:  # PgUp
+            self.number -= 10
+            self.number = max(self.mi, self.number)
+        elif char == curses.KEY_ENTER or char == 10 or char == 13:
+            self.confirm(self.number)
+            return
+        elif char == 27:  # ESCAPE
+            self.cancel()
+            return
+        self.draw()
+
+
+class InputList(Input):
+
+    def __init__(self, stdscr, title: str, confirm: callable, cancel: callable,
+                 options: List[Any], selected: Any):
+        super().__init__(stdscr, title, confirm, cancel)
+        self.options = options
+        self.selected = selected
+        self.menu: Optional[Menu] = None
+
+    def on_select(self, option):
+        self.selected = option
+        self.menu.idx = len(self.options) + 1
+        self.draw()
+
+    def draw(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        h, w = len(self.options)+8, 65
+
+        self.wpos = Pos(maxy//2-h//2, maxx//2-w//2)
+        self.win = self.stdscr.subwin(h, w, self.wpos.y, self.wpos.x)
+        self.win.bkgd(' ', curses.color_pair(3) | curses.A_BOLD)
+        self.win.erase()
+        self.win.box()
+        self.win.addstr(2, 2, self.title)
+
+        msg = '(ESC to cancel)'
+        self.win.addstr(h-2, w-len(msg)-2, msg)
+
+        items = []
+        for option in self.options:
+            items.append(MenuItem(
+                f'* {option}' if option == self.selected else f'  {option}',
+                functools.partial(self.on_select, option)
+            ))
+
+        items.append(None)
+        items.append(MenuItem(
+            '  Ok',
+            functools.partial(self.confirm, self.selected)
+        ))
+
+        if self.menu:
+            idx = self.menu.idx
+        else:
+            idx = 0
+        self.menu = Menu(
+            self.win,
+            Pos(4, 4),
+            items,
+            ljust=25,
+            idx=idx)
+        self.win.refresh()
+
+    def handle_char(self, char: int):
+        if char == 27:  # ESCAPE
+            self.cancel()
+            return
+        if self.menu:
+            self.menu.handle_char(char)
+        self.draw()
+
+
+def ensure_config_defaults(config: dict, source: List[dict]):
+    for data in source:
+        if 'int' in data:
+            key = data['int']
+            if key not in config:
+                v = data.get('default', 0)
+                config[key] = v
+        elif 'str' in data:
+            key = data['str']
+            if key not in config:
+                v = data.get('default', '')
+                config[key] = v
+        elif 'list' in data:
+            key = data['list']
+            if key not in config:
+                v = data.get('default', data['options'][0])
+                config[key] = v
+        elif 'section' in data:
+            key = data['section']
+            if key not in config:
+                config[key] = {}
+            config = config[key]
+            ensure_config_defaults(config, data['items'])
+
+
+def _get_val_helper(probe: str, part: Part, section: Optional[str], key: str,
+                    dval: Any):
+    if part is Part.Config:
+        keys = [probe, part.value, section, key]
+        return State.get_config_value(keys, dval)
+
+    return State.get_env_var(probe, key, dval)
+
 
 class Confirm:
     def __init__(self, stdscr, msg: str, confirm: callable, cancel: callable):
@@ -297,7 +642,7 @@ class Confirm:
         self.msg = msg
         self.confirm = confirm
         self.cancel = cancel
-        self.draw()
+        self.menu: Optional[Menu] = None
 
     def draw(self):
         maxy, maxx = self.stdscr.getmaxyx()
@@ -312,9 +657,9 @@ class Confirm:
             self.win.addstr(n+2, 4, s)
 
         self.menu = Menu(self.win, Pos(4, 4), (
-            MenuItem(' No ', self.cancel),
             MenuItem(' Yes ', self.confirm),
-        ), horizontal=True)
+            MenuItem(' No ', self.cancel),
+        ), horizontal=True, idx=1)
 
 
 class Fatal:
@@ -347,12 +692,15 @@ class InfraSonarDisplay:
     def __init__(self, stdscr: "_curses._CursesWindow"):
         self.stdscr = stdscr
         self.confirm: Optional[Confirm] = None
-        self.token_dialog: Optional[TokenDialog] = None
+        self.input_dialog: Optional[Input] = None
         self.fatal: Optional[Fatal] = None
-        self.menu: Optional[Menu] = None
+        self.main_menu: Optional[Menu] = None
+        self.probes_menu: Optional[Menu] = None
+        self.probe_menu: Optional[Menu] = None
+        self.probe: Optional[str] = None
         self.apply_step = 1
         self.done: bool = False
-        self.has_changes = False
+        self.warning: str = None
         self._spin: Optional(Pos) = None
 
     async def _spinner(self):
@@ -383,6 +731,8 @@ class InfraSonarDisplay:
         curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_RED)
         curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_CYAN)
+        curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLUE)
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLACK)
         self.stdscr.nodelay(True)
         self.stdscr.bkgd(' ', curses.color_pair(1) | curses.A_BOLD)
         self.make_display()
@@ -434,6 +784,140 @@ class InfraSonarDisplay:
         finally:
             self.stop_spinner()
 
+    def confirm_probe_input(self, probe: str, part: Part,
+                            section: Optional[str], key: str, value: Any):
+        self.input_dialog = None
+        if part is Part.Config:
+            if State.config_data.get(probe) is None:
+                State.config_data[probe] = {'config': {}}
+            if State.config_data[probe].get('config') is None:
+                State.config_data[probe]['config'] = {}
+            if section:
+                if State.config_data[probe]['config'].get(section) is None:
+                    d = State.config_data[probe]['config'][section] = {}
+                else:
+                    d = State.config_data[probe]['config'][section]
+            else:
+                d = State.config_data[probe]['config']
+        else:
+            if State.compose_data['services'].get(probe) is None:
+                State.compose_data['services'][probe] = {}
+            d = State.compose_data['services'][probe]
+            if d.get('environment') is None:
+                d['environment'] = {}
+            d = d['environment']
+
+        if value != d.get(key):
+            State.has_changes = True
+            d[key] = value
+        self.to_probe()
+
+    def _gen_probe_input_str(self, title: str, probe, part, section, key,
+                             data: dict) -> InputStr:
+        dval = data.get('default', '')
+        if key in ('secret', 'password'):
+            text = dval
+            secret = True
+        else:
+            secret = False
+            text = _get_val_helper(probe, part, section, key, dval)
+        return InputStr(
+            self.stdscr,
+            title,
+            functools.partial(
+                self.confirm_probe_input,
+                probe, part, section, key),
+            self.to_probe,
+            lambda _: True,
+            text,
+            PRINTABLE_CHARS,
+            secret=secret)
+
+    def _gen_probe_input_int(self, title: str, probe, part, section, key,
+                             data: dict) -> InputInt:
+        mi, ma = data.get('min', -99999), data.get('max', 99999)
+        dval = data.get('default', 0)
+        number = _get_val_helper(probe, part, section, key, dval)
+        return InputInt(
+            self.stdscr,
+            title,
+            functools.partial(
+                self.confirm_probe_input,
+                probe, part, section, key),
+            self.to_probe,
+            number,
+            mi,
+            ma)
+
+    def _gen_probe_input_list(self, title: str, probe, part, section, key,
+                              data: dict) -> InputList:
+        options = data['options']
+        dval = data.get('default', options[0])
+        selected = _get_val_helper(probe, part, section, key, dval)
+        return InputList(
+            self.stdscr,
+            title,
+            functools.partial(
+                self.confirm_probe_input,
+                probe, part, section, key),
+            self.to_probe,
+            options,
+            selected)
+
+    def generate_input_items(self, source: List[dict], probe: str, part: Part,
+                            section: Optional[str] = None) -> List[callable]:
+        """The subject is either "environment" or "config".
+        """
+        items = []
+        for data in source:
+            if 'if' in data:
+                assert part is Part.Config  # only supported by config
+                ifdata = data['if']
+                if '==' in ifdata:
+                    key, target = ifdata.split('==')
+                    compare = eq
+                elif '!=' in ifdata:
+                    key, target = ifdata.split('!=')
+                    compare = ne
+                target = target.strip()
+                keys = [x.strip() for x in key.split('.')]
+                keys.insert(0, probe)
+
+                val = State.get_config_value(keys)
+                if not compare(val, target):
+                    continue  # skip when if- not true
+
+            if 'section' in data:
+                assert part is Part.Config  # only supported by config
+                items.extend(self.generate_input_items(
+                    data['items'],
+                    probe,
+                    part,
+                    data['section']))
+                continue
+
+            s = f'.{section}' if section else ''
+            if 'str' in data:
+                key = data["str"]
+                title = f'Set {part.value}{s}.{key}'
+                items.append((title, functools.partial(
+                    self._gen_probe_input_str,
+                    title, probe, part, section, key, data)))
+            elif 'int' in data:
+                key = data['int']
+                title = f'Set {part.value}{s}.{key}'
+                items.append((title, functools.partial(
+                    self._gen_probe_input_int,
+                    title, probe, part, section, key, data)))
+            elif 'list' in data:
+                key = data['list']
+                title = f'Set {part.value}{s}.{key}'
+                items.append((title, functools.partial(
+                    self._gen_probe_input_list,
+                    title, probe, part, section, key, data)))
+
+        return items
+
     async def check_docker_installation(self):
         y = 8
         self.stdscr.addstr(y, 4, "Check Docker installation................")
@@ -473,12 +957,28 @@ class InfraSonarDisplay:
             self.fatal_error(f'Unexpected error: {msg}')
         else:
             self.stdscr.addstr(y, 45, 'OK')
+            await self.check_probes_config_meta()
+        finally:
+            self.stop_spinner()
+
+    async def check_probes_config_meta(self):
+        y = 9
+        self.stdscr.addstr(y, 4, "Check and update probes config meta......")
+        self.start_spinner(y, 45)
+        try:
+            await State.read_probes_config_meta()
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            msg = f"Failed to download probes config meta (Error: {msg})"
+            self.fatal_error(msg, "Please check your network configuration.")
+        else:
+            self.stdscr.addstr(y, 45, 'OK')
             await self.check_infrasonar_installation()
         finally:
             self.stop_spinner()
 
     async def check_infrasonar_installation(self):
-        y = 9
+        y = 10
         self.stdscr.addstr(y, 4, "Check InfraSonar appliance status........")
         self.start_spinner(y, 45)
         try:
@@ -487,6 +987,7 @@ class InfraSonarDisplay:
                 cmd,
                 stderr=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
+                cwd=State.compose_path,
             )
 
             stdout, stderr = await proc.communicate()
@@ -495,10 +996,17 @@ class InfraSonarDisplay:
             if err:
                 raise Exception(err)
             State.read_infrasonar_status(out)
-            if State.status != 'running':
+            if State.status != 'running' and State.status != 'restarting':
                 raise InfraSonarNotRunning()
+            ac_env = State.compose_data['services']['agentcore']['environment']
+            if ac_env.get('HUB_HOST', 'hub.infrasonar.com') != State.hub_host:
+                raise InfraSonarWrongEnv()
         except InfraSonarNotRunning:
             self.fatal_error(f'InfraSonar status: {State.status}')
+        except InfraSonarWrongEnv:
+            self.fatal_error(
+                'InfraSonar enviroment mismatch',
+                'Please check the --development argument (see --help)')
         except Exception as e:
             msg = str(e) or type(e).__name__
             self.fatal_error(f'Unexpected error: {msg}')
@@ -510,29 +1018,45 @@ class InfraSonarDisplay:
         finally:
             self.stop_spinner()
 
-    async def test_panel(self):
-        panel = curses.panel.new_panel(self.stdscr)
-
     def set_agentcore_token(self, token):
         if token != State.agentcore_token:
             State.agentcore_token = token
-            self.has_changes = True
-            self.menu = None
+            State.has_changes = True
+            self.main_menu = None
         self.to_main()
 
     def set_agent_token(self, token):
         if token != State.agent_token:
             State.agent_token = token
-            self.has_changes = True
-            self.menu = None
+            State.has_changes = True
+            self.main_menu = None
+        self.to_main()
+
+    def set_agentcore_zone_id(self, zone):
+        if zone != State.agentcore_zone_id:
+            State.agentcore_zone_id = zone
+            State.has_changes = True
+            self.main_menu = None
         self.to_main()
 
     def to_main(self):
+        self.warning: Optional[str] = None
         self.confirm: Optional[Confirm] = None
-        self.token_dialog: Optional[TokenDialog] = None
+        self.input_dialog: Optional[Input] = None
+        self.probes_menu: Optional[Menu] = None
+        self.probe_menu: Optional[Menu] = None
         self.apply_step = None
         curses.curs_set(0)
         State.step = Step.Main
+        asyncio.ensure_future(self.async_make_display())
+
+    def to_probes(self):
+        State.step = Step.ManageProbes
+        asyncio.ensure_future(self.async_make_display())
+
+    def to_probe(self):
+        State.step = Step.ManageProbe
+        self.input_dialog: Optional[Input] = None
         asyncio.ensure_future(self.async_make_display())
 
     async def async_make_display(self):
@@ -544,24 +1068,48 @@ class InfraSonarDisplay:
             'Do you want to quit without saving?',
             self.set_exit,
             self.to_main)
+        asyncio.ensure_future(self.async_make_display())
 
     def on_change_agentcore_token(self):
-        self.token_dialog = TokenDialog(
+        self.input_dialog = InputStr(
             self.stdscr,
             'Agentcore token',
-            State.agentcore_token,
             self.set_agentcore_token,
-            self.to_main)
+            self.to_main,
+            lambda x: len(x) == TOKEN_LEN,
+            State.agentcore_token,
+            charset=TOKEN_CHARS,
+            max_len=TOKEN_LEN,
+            secret=True)
+        asyncio.ensure_future(self.async_make_display())
 
     def on_change_agent_token(self):
-        self.token_dialog = TokenDialog(
+        self.input_dialog = InputStr(
             self.stdscr,
             'Agent token',
-            State.agent_token,
             self.set_agent_token,
-            self.to_main)
+            self.to_main,
+            lambda x: len(x) == TOKEN_LEN,
+            State.agent_token,
+            charset=TOKEN_CHARS,
+            max_len=TOKEN_LEN,
+            secret=True)
+        asyncio.ensure_future(self.async_make_display())
 
     def on_change_zone(self):
+        self.input_dialog = InputInt(
+            self.stdscr,
+            'Zone',
+            self.set_agentcore_zone_id,
+            self.to_main,
+            State.agentcore_zone_id,
+            0,
+            9)
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_manage_probe_collectors(self):
+        State.step = Step.ManageProbes
+        asyncio.ensure_future(self.async_make_display())
 
     async def write_to_disk(self):
         try:
@@ -580,11 +1128,12 @@ class InfraSonarDisplay:
                 cmd,
                 stderr=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
+                cwd=State.compose_path,
             )
 
             stdout, stderr = await proc.communicate()
-            out = stdout.decode()
-            err = stderr.decode()
+            _out = stdout.decode()
+            _err = stderr.decode()
         except Exception as e:
             return self.fatal_error(str(e))
         self.apply_step += 1
@@ -598,11 +1147,12 @@ class InfraSonarDisplay:
                 cmd,
                 stderr=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
+                cwd=State.compose_path,
             )
 
             stdout, stderr = await proc.communicate()
-            out = stdout.decode()
-            err = stderr.decode()
+            _out = stdout.decode()
+            _err = stderr.decode()
         except Exception as e:
             return self.fatal_error(str(e))
         self.apply_step += 1
@@ -611,7 +1161,7 @@ class InfraSonarDisplay:
     def save_and_apply_changes(self):
         self.apply_step = 1
         State.step = Step.Apply
-        self.menu: Optional[Menu] = None
+        self.main_menu: Optional[Menu] = None
         asyncio.ensure_future(self.async_make_display())
         asyncio.ensure_future(self.write_to_disk())
 
@@ -636,11 +1186,12 @@ class InfraSonarDisplay:
             y += 2
             self.stdscr.addstr(y, 4, "Done! (press any key to continue)")
             self.stop_spinner()
-            self.has_changes = False
+            State.has_changes = False
         else:
             self.start_spinner(y, x)
 
     def on_init(self):
+        self.add_header()
         maxy, maxx = self.stdscr.getmaxyx()
         self.stdscr.addstr(maxy - 2, maxx - 20, "Press 'q' to quit")
         self.stdscr.refresh()
@@ -655,54 +1206,208 @@ class InfraSonarDisplay:
             asyncio.ensure_future(self.check_root())
 
     def on_main(self):
+        self.add_header()
         maxy, maxx = self.stdscr.getmaxyx()
         msg = f"InfraSonar status: {State.status}"
         self.stdscr.addstr(maxy - 2, maxx - len(msg) - 2, msg)
         self.stdscr.refresh()
 
-        if self.menu:
-            self.menu.draw()
+        idx = self.main_menu.idx if self.main_menu else 0
+        items = [
+            MenuItem(
+                'Manage probe collectors',
+                self.on_manage_probe_collectors),
+            None,
+            MenuItem(
+                'Change agentcore token',
+                self.on_change_agentcore_token),
+            MenuItem(
+                'Change agent token',
+                self.on_change_agent_token),
+            MenuItem(
+                'Change zone',
+                self.on_change_zone),
+            None,
+        ]
+        if State.has_changes:
+            items.extend([
+                MenuItem(
+                    'Save and apply changes',
+                    self.save_and_apply_changes),
+                MenuItem(
+                    'Exit without saving',
+                    self.on_exit_without_saving),
+            ])
         else:
-            items = [
-                MenuItem(
-                    'Change agentcore token  ',
-                    self.on_change_agentcore_token),
-                MenuItem(
-                    'Change agent token      ',
-                    self.on_change_agent_token),
-                MenuItem('Change zone             ', lambda: None),
-                None,
-            ]
-            if self.has_changes:
-                items.extend([
-                    MenuItem(
-                        'Save and apply changes  ',
-                        self.save_and_apply_changes),
-                    MenuItem(
-                        'Exit without saving     ',
-                        self.on_exit_without_saving),
-                ])
-            else:
-                items.append(
-                    MenuItem('Exit                    ', self.set_exit)
-                )
+            items.append(
+                MenuItem('Exit', self.set_exit)
+            )
 
-
-            self.menu = Menu(self.stdscr, Pos(6, 4), items, horizontal=False)
+        self.main_menu = Menu(
+            self.stdscr, Pos(6, 4), items, horizontal=False, ljust=30, idx=idx)
 
         if self.confirm:
             self.confirm.draw()
 
-        if self.token_dialog:
-            self.token_dialog.draw()
+        if self.input_dialog:
+            self.input_dialog.draw()
+
+    async def _on_synchronize_probes(self, y: int):
+        State.step = Step.Synchronize
+        self.warning: Optional[str] = None
+        self.start_spinner(y, 2)
+        try:
+            await State.refresh_enbled_probes()
+            await asyncio.sleep(1)
+        except Exception as e:
+            self.warning = str(e) or type(e).__name__
+        self.stop_spinner()
+        State.step = Step.ManageProbes
+        self.probes_menu: Optional[Menu] = None
+        self.make_display()
+
+    def on_synchronize_probes(self, y: int):
+        asyncio.ensure_future(self._on_synchronize_probes(y))
+
+    def on_manage_probe(self, probe):
+        State.step = Step.ManageProbe
+        self.probe_menu: Optional[Menu] = None
+        self.probe = probe
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_probe_set(self, input_dialog: Input):
+        self.input_dialog = input_dialog()
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_manage_probe_display(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        meta = State.probes_config_meta
+        meta_env = meta.get(self.probe, {}).get('environment', {})
+        meta_cnf = meta.get(self.probe, {}).get('config', {})
+        inputs: List[Input] = []
+
+        if meta_cnf:
+            if self.probe not in State.config_data:
+                State.has_changes = True
+                config = {}
+                ensure_config_defaults(config, meta_cnf)
+                State.config_data[self.probe] = {'config': config}
+
+            use = State.config_data.get(self.probe, {}).get('use')
+            if not use:
+                State.config_data[self.probe]['config']
+                inputs.extend(self.generate_input_items(
+                    meta_cnf,
+                    self.probe,
+                    Part.Config))
+
+        if meta_env:
+            if inputs:
+                inputs.append(None)
+            inputs.extend(self.generate_input_items(
+                meta_env,
+                self.probe,
+                Part.Environment))
+
+        items = []
+        for inp in inputs:
+            if inp is None:
+                items.append(None)
+            else:
+                title, func = inp
+                items.append(MenuItem(
+                    title,
+                    functools.partial(self.on_probe_set, func)
+                ))
+
+        if items:
+            items.append(None)
+        items.append(MenuItem(
+            'Back',
+            self.to_probes
+        ))
+
+        self.stdscr.addstr(2, 4, f'Collector: {self.probe}')
+        self.stdscr.addstr(3, 4, '-'*50)
+
+        idx = self.probe_menu.idx if self.probe_menu else 0
+        self.probe_menu = Menu(
+            self.stdscr,
+            Pos(5, 4),
+            items,
+            ljust=50,
+            idx=idx)
+
+        if self.input_dialog:
+            self.input_dialog.draw()
+
+    def on_manage_collectors(self):
+        maxy, maxx = self.stdscr.getmaxyx()
+        self.stdscr.refresh()
+
+        msg = r"""
+You can configure the probe collectors here.
+
+When you choose to synchronize, all enabled probes in your InfraSonar
+container will become available here, and disabled probes will be removed.
+
+A probe marked with (!) requires configuration that is currently missing.
+""".strip()
+        for y, line in enumerate(msg.splitlines()):
+            self.stdscr.addstr(2+y, 4, line)
+
+        if self.warning:
+            color = curses.color_pair(4)
+            self.stdscr.addstr(9, 4, f':: {self.warning}', color)
+        else:
+            self.stdscr.addstr(9, 4, '-'*70)
+
+        if self.probes_menu:
+            self.probes_menu.draw()
+        else:
+            y = 11
+            items = []
+            for probe in State.get_probes():
+                required =  State.probes_config_meta.get(probe)
+                config = State.config_data.get(probe, {}).get('config')
+                warn = ' (!)' if required and not config else ''
+                items.append(MenuItem(
+                    f'{probe}{warn}',
+                    functools.partial(self.on_manage_probe, probe)
+                ))
+            items.append(None)
+            offset = len(items)
+            items.append(MenuItem(
+                    'Synchronize',
+                    lambda: self.on_synchronize_probes(y+offset)))
+            items.append(MenuItem(
+                'Back to main',
+                self.to_main))
+
+            self.probes_menu = Menu(
+                self.stdscr,
+                Pos(y, 4),
+                items,
+                horizontal=False,
+                ljust=30)
+
+
+    def add_header(self):
+        msg = r"""    ___       __          ___
+   |_ _|_ _  / _|_ _ __ _/ __| ___ _ _  __ _ _ _
+    | || ' \|  _| '_/ _` \__ \/ _ \ ' \/ _` | '_|
+   |___|_||_|_| |_| \__,_|___/\___/_||_\__,_|_|
+"""
+
+        for y, line in enumerate(msg.splitlines()):
+            self.stdscr.addstr(1+y, 1, line)
+
 
     def make_display(self) -> None:
+        maxy, maxx = self.stdscr.getmaxyx()
         self.stdscr.erase()
-        self.stdscr.addstr(1, 1, r"""    ___       __          ___
-    |_ _|_ _  / _|_ _ __ _/ __| ___ _ _  __ _ _ _
-     | || ' \|  _| '_/ _` \__ \/ _ \ ' \/ _` | '_|
-    |___|_||_|_| |_| \__,_|___/\___/_||_\__,_|_|
-""")
+        if maxx < 80 or maxy < 20:
+            return
 
         self.stdscr.box()
 
@@ -712,12 +1417,17 @@ class InfraSonarDisplay:
             self.on_main()
         elif State.step is Step.Apply:
             self.draw_apply()
+        elif State.step is Step.ManageProbes:
+            self.on_manage_collectors()
+        elif State.step is Step.ManageProbe:
+            self.on_manage_probe_display()
 
     def handle_char(self, char: int) -> None:
-        if self.token_dialog:
-            self.token_dialog.handle_char(char)
+        if self.input_dialog:
+            self.input_dialog.handle_char(char)
         elif self.confirm:
-            self.confirm.menu.handle_char(char)
+            if self.confirm.menu:
+                self.confirm.menu.handle_char(char)
         elif State.step is Step.Init or (
                 State.step is Step.Apply and self.fatal):
             if chr(char) == 'q':
@@ -725,7 +1435,11 @@ class InfraSonarDisplay:
         elif State.step is Step.Apply and self.apply_step > 3:
             self.to_main()
         elif State.step is Step.Main:
-            self.menu.handle_char(char)
+            self.main_menu.handle_char(char)
+        elif State.step is Step.ManageProbes:
+            self.probes_menu.handle_char(char)
+        elif State.step is Step.ManageProbe:
+            self.probe_menu.handle_char(char)
 
 
 async def display_main(stdscr):
@@ -734,13 +1448,13 @@ async def display_main(stdscr):
 
 
 def main(stdscr) -> None:
-    loop = asyncio.get_event_loop()
     # add signal handlers
     return State.loop.run_until_complete(display_main(stdscr))
 
 
 if __name__ == "__main__":
-    setproctitle('appliance-toolkit')
+    os.environ.setdefault('ESCDELAY', '25')
+    setproctitle('appliance-manager')
 
     parser = argparse.ArgumentParser(prog='appliance-toolkit')
     parser.add_argument(
@@ -758,11 +1472,15 @@ if __name__ == "__main__":
         print(f'InfraSonar appliance toolkit version {__version__}')
         sys.exit(0)
 
-    if args.development:
+    if args.development or 1:  # TODO: rm or
         State.api_url = 'https://devapi.infrasonar.com'
         State.hub_host = 'devhub.infrasonar.com'
     else:
         State.api_url = 'https://api.infrasonar.com'
         State.hub_host = 'hub.infrasonar.com'
+
+    _AGENTCORE['environment']['HUB_HOST'] = State.hub_host
+    _SPEEDTEST_AGENT['environment']['API_URI'] = State.api_url
+    _DOCKER_AGENT['environment']['API_URI'] = State.api_url
 
     curses.wrapper(main)

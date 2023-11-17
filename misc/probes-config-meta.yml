@@ -1,0 +1,66 @@
+# InfraSonar - probes configuration meta data
+x-environment-template: &environment
+  environment:
+  - int: MAX_PACKAGE_SIZE
+    min: 1
+    max: 2000
+    default: 500
+  - int: MAX_CHECK_TIMEOUT
+    min: 1
+    max: 1800
+    default: 300
+  - list: LOG_LEVEL
+    options:
+    - "debug"
+    - "info"
+    - "warning"
+    - "error"
+    - "critical"
+    default: "warning"
+
+snmp: &snmp
+  << : *environment
+  config:
+  - list: version
+    options:
+    - "2c"
+    - "3"
+    default: "2c"
+  - section: community
+    items:
+    - str: secret
+  - str: username
+    if: config.version==3
+  - section: auth
+    if: config.version==3
+    items:
+    - list: type
+      options:
+      - USM_AUTH_NONE
+      - USM_AUTH_HMAC96_MD5
+      - USM_AUTH_HMAC96_SHA
+    - str: password
+      if: config.auth.type!=USM_AUTH_NONE
+  - section: priv
+    if: config.version==3
+    items:
+    - list: type
+      options:
+      - USM_AUTH_NONE
+      - USM_AUTH_HMAC96_MD5
+      - USM_AUTH_HMAC96_SHA
+    - str: password
+      if: config.priv.type!=USM_AUTH_NONE
+
+unify:
+  << : *snmp
+
+wmi:
+  << : *environment
+  config:
+  - str: username
+  - str: password
+
+paloalto:
+  config:
+  - str: secret
