@@ -111,6 +111,7 @@ PRINTABLE_CHARS = set([ord(c) for c in string.printable])
 TOKEN_CHARS = set([ord(c) for c in '0123456789abcdef'])
 TOKEN_LEN = 32
 
+
 class DockerNotFound(Exception):
     install_url = 'https://docs.docker.com/engine/install'
 
@@ -552,6 +553,7 @@ class InputStr(Input):
                 self.curs_x += 1
         self.draw()
 
+
 class InputInt(Input):
 
     def __init__(self, stdscr, title: str, confirm: callable, cancel: callable,
@@ -842,7 +844,8 @@ class LogView:
         if char == 27:  # ESC
             self.stop()
             self.parent.to_probe()
-        elif char in (curses.KEY_UP, curses.KEY_DOWN, 338, 339):
+        elif char in (curses.KEY_UP, curses.KEY_DOWN, 338, 339,
+                      curses.KEY_HOME, curses.KEY_END):
             if not self.viewport:
                 return
             n, h = self.viewport
@@ -858,10 +861,15 @@ class LogView:
                 self.offset -= h-1
             elif char == 338:  # PgDown
                 self.offset += h-1
+            elif char == curses.KEY_HOME:
+                self.offset = 0
+            elif char == curses.KEY_END:
+                self.offset = m+1
             self.offset = max(0, self.offset)
             if self.offset > m:
                 self.offset = None  # auto-scroll
             self.redraw = True
+
 
 class InfraSonarDisplay:
     def __init__(self, stdscr: "_curses._CursesWindow"):
@@ -1048,7 +1056,7 @@ class InfraSonarDisplay:
             selected)
 
     def generate_input_items(self, source: List[dict], probe: str, part: Part,
-                            section: Optional[str] = None) -> List[callable]:
+                             section: Optional[str] = None) -> List[callable]:
         """The subject is either "environment" or "config".
         """
         items = []
@@ -1705,7 +1713,6 @@ class InfraSonarDisplay:
         if items:
             items.append(None)
 
-
         if State.has_changes:
             items.append(MenuItem(
                 'Save and apply changes',
@@ -1768,7 +1775,7 @@ class InfraSonarDisplay:
         idx = self.probes_menu.idx if self.probes_menu else 0
         items = []
         for probe in State.get_probes():
-            required =  State.probes_config_meta.get(probe, {}).get('config')
+            required = State.probes_config_meta.get(probe, {}).get('config')
             probe_cnf = State.config_data.get(probe, {})
             conf_or_use = probe_cnf.get('config') or probe_cnf.get('use')
             warn = ' (!)' if required and not conf_or_use else ''
@@ -1795,7 +1802,6 @@ class InfraSonarDisplay:
 
         self.help.draw()
 
-
     def add_header(self):
         msg = r"""    ___       __          ___
    |_ _|_ _  / _|_ _ __ _/ __| ___ _ _  __ _ _ _
@@ -1805,7 +1811,6 @@ class InfraSonarDisplay:
 
         for y, line in enumerate(msg.splitlines()):
             self.stdscr.addstr(1+y, 1, line)
-
 
     def make_display(self) -> None:
         maxy, maxx = self.stdscr.getmaxyx()
