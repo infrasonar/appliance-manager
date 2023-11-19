@@ -26,8 +26,16 @@ _RE_DOCKER_VERSION = \
 _RE_COMPOSE_PATH = \
     re.compile(r'infrasonar\s+([a-z]+).*\s+(\/.*)docker-compose\.yml')
 _RE_RUNNING_PROBE = \
-    re.compile(r'^infrasonar-([a-z_]+)-probe-1.*$')
+    re.compile(r'^infrasonar-([a-z0-9_]+)-probe-1.*$')
 _MIN_DOCKER_VERSION = 24
+
+_X_INFRASONAR_TEMPLATE = {
+    'labels': {'com.centurylinklabs.watchtower.scope': '${AGENTCORE_TOKEN}'},
+    'logging': {'options': {'max-size': '5m'}},
+    'network_mode': 'host',
+    'restart': 'always',
+    'volumes': ['./data:/data/']
+}
 
 _WATCH_TOWER = {
     'environment': {
@@ -41,14 +49,6 @@ _WATCH_TOWER = {
         '/var/run/docker.sock:/var/run/docker.sock',
         '/etc/localtime:/etc/localtime:ro'
     ]
-}
-
-_X_INFRASONAR_TEMPLATE = {
-    'labels': {'com.centurylinklabs.watchtower.scope': '${AGENTCORE_TOKEN}'},
-    'logging': {'options': {'max-size': '5m'}},
-    'network_mode': 'host',
-    'restart': 'always',
-    'volumes': ['./data:/data/']
 }
 
 _AGENTCORE = {
@@ -113,7 +113,7 @@ TOKEN_LEN = 32
 
 
 class DockerNotFound(Exception):
-    install_url = 'https://docs.docker.com/engine/install'
+    install_url = 'https://docs.docker.com/compose/install/'
 
 
 class DockerNoVersion(Exception):
@@ -125,6 +125,10 @@ class DockerVersionTooOld(Exception):
 
 
 class InfraSonarNotRunning(Exception):
+    pass
+
+
+class InfraSonarNotFound(Exception):
     pass
 
 
@@ -141,6 +145,7 @@ class Step(Enum):
     ManageProbe = 5
     ManageAgents = 6
     ViewLogs = 7
+    Install = 8
 
 
 class Part(Enum):
@@ -759,7 +764,7 @@ class Help:
         self.win.box()
         for n, s in enumerate(lines):
             self.win.addstr(n+2, 4, s)
-        msg = "(press 'h' to close)"
+        msg = "(press 'q' to close)"
         self.win.addstr(h-2, w-len(msg)-2, msg)
         self.win.refresh()
 
@@ -777,7 +782,12 @@ class Fatal:
         lines = textwrap.wrap(self.msg, width=width-8)
         if self.suggestion:
             lines.append('')
-            lines.extend(textwrap.wrap(self.suggestion, width=width-8))
+            suggs = self.suggestion.splitlines()
+            for sugg in suggs:
+                if sugg == '':
+                    lines.append('')
+                else:
+                    lines.extend(textwrap.wrap(sugg, width=width-8))
         lines.append('')
         lines.append("Press 'q' to quit")
         h, w = len(lines) + 4, width
@@ -934,6 +944,8 @@ class InfraSonarDisplay:
                 self.handle_char(char)
 
     def fatal_error(self, msg: str, suggestion: Optional[str] = None):
+        self.confirm = None
+        self.input_dialog = None
         self.fatal = Fatal(self.stdscr, msg, suggestion)
 
     async def check_root(self):
@@ -1177,7 +1189,7 @@ class InfraSonarDisplay:
                 cmd,
                 stderr=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                cwd=State.compose_path,
+                cwd=State.compose_path,  # Compose path is None here
             )
 
             stdout, stderr = await proc.communicate()
@@ -1186,14 +1198,26 @@ class InfraSonarDisplay:
             if err:
                 raise Exception(err)
             State.read_infrasonar_status(out)
+            if State.status == 'not found':
+                raise InfraSonarNotFound()
             if State.status != 'running' and State.status != 'restarting':
                 raise InfraSonarNotRunning()
             ac_env = State.compose_data['services']['agentcore']['environment']
             if ac_env.get('HUB_HOST', 'hub.infrasonar.com') != State.hub_host:
                 raise InfraSonarWrongEnv()
             await State.read_running_probes()
+        except InfraSonarNotFound:
+            self.on_install()
+            return
         except InfraSonarNotRunning:
-            self.fatal_error(f'InfraSonar status: {State.status}')
+            if State.status == 'not running':
+                sugg = \
+                    'Start the appliance using the following command:\n\n' \
+                    '  docker compose ' \
+                    f'-f {State.compose_path}/docker-compose.yml up -d'
+            else:
+                sugg = None
+            self.fatal_error(f'InfraSonar status: {State.status}', sugg)
         except InfraSonarWrongEnv:
             self.fatal_error(
                 'InfraSonar enviroment mismatch',
@@ -1309,6 +1333,104 @@ class InfraSonarDisplay:
             State.agentcore_zone_id,
             0,
             9)
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_install_done(self, zone_id: Optional[int] = None):
+        if zone_id is not None:
+            State.agentcore_zone_id = zone_id
+
+        self.input_dialog = None
+
+        watchtower = _X_INFRASONAR_TEMPLATE.copy()
+        watchtower.update(_WATCH_TOWER)
+
+        agentcore = _X_INFRASONAR_TEMPLATE.copy()
+        agentcore.update(_AGENTCORE)
+
+        docker_agent = _X_INFRASONAR_TEMPLATE.copy()
+        docker_agent.update(_DOCKER_AGENT)
+
+        State.compose_data = {
+            'x-infrasonar-template': _X_INFRASONAR_TEMPLATE,
+            'services': {
+                'watchtower': watchtower,
+                'agentcore': agentcore,
+                'docker-agent': docker_agent,
+            }
+        }
+
+        try:
+            path = os.path.join(State.compose_path, 'data', 'config')
+            if not os.path.exists(path):
+                os.makedirs(path)
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self.fatal_error(msg)
+        else:
+            self.save_and_apply_changes()
+
+    def on_install_agentcore_zone_id(self, token: Optional[str] = None):
+        if token is not None:
+            State.agent_token = token
+
+        self.input_dialog = InputInt(
+            self.stdscr,
+            'Enter your angetcore zone Id (leave 0 if unsure)',
+            self.on_install_done,
+            self.on_install_agent_token,
+            State.agentcore_zone_id or 0,
+            0,
+            9)
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_install_agent_token(self, token: Optional[str] = None):
+        if token is not None:
+            State.agentcore_token = token
+
+        self.input_dialog = InputStr(
+            self.stdscr,
+            'Enter your agent token',
+            self.on_install_agentcore_zone_id,
+            self.on_install_agentcore_token,
+            lambda x: len(x) == TOKEN_LEN,
+            State.agent_token or '',
+            charset=TOKEN_CHARS,
+            max_len=TOKEN_LEN,
+            secret=True)
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_install_agentcore_token(self, path: Optional[str] = None):
+        if path is not None:
+            State.compose_path = path
+
+        self.input_dialog = InputStr(
+            self.stdscr,
+            'Enter your agentcore token',
+            self.on_install_agent_token,
+            self.on_install,
+            lambda x: len(x) == TOKEN_LEN,
+            State.agentcore_token or '',
+            charset=TOKEN_CHARS,
+            max_len=TOKEN_LEN,
+            secret=True)
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_install(self):
+        State.step = Step.Install
+
+        if State.compose_path is None:
+            State.compose_path = '/etc/infrasonar'
+
+        self.input_dialog = InputStr(
+            self.stdscr,
+            'Where do you want to install InfraSonar?',
+            self.on_install_agentcore_token,
+            self.set_exit,
+            lambda _: True,
+            State.compose_path,
+            PRINTABLE_CHARS,
+            max_len=60,
+            secret=False)
         asyncio.ensure_future(self.async_make_display())
 
     def on_manage_probes(self):
@@ -1545,7 +1667,9 @@ class InfraSonarDisplay:
 
     def do_install_agent(self, agent: str):
         State.has_changes = True
-        State.compose_data['services'][f'{agent}-agent'] = _AGENTS[agent]
+        d = State.compose_data['x-infrasonar-template'].copy()
+        d.update(_AGENTS[agent])
+        State.compose_data['services'][f'{agent}-agent'] = d
         self.to_agents()
 
     def on_install_agent(self, agent: str):
@@ -1783,7 +1907,9 @@ class InfraSonarDisplay:
                 f'{probe}{warn}',
                 functools.partial(self.on_manage_probe, probe)
             ))
-        items.append(None)
+        if items:
+            items.append(None)
+
         offset = len(items)
         items.append(MenuItem(
                 'Synchronize',
@@ -1836,6 +1962,9 @@ class InfraSonarDisplay:
             self.logview.redraw = True
             self.logview.viewport = None
             self.logview.offset = None
+        elif State.step is Step.Install:
+            self.stdscr.refresh()
+            self.input_dialog.draw()
 
     def handle_char(self, char: int) -> None:
         if self.input_dialog:
@@ -1844,15 +1973,15 @@ class InfraSonarDisplay:
             if self.confirm.menu:
                 self.confirm.menu.handle_char(char)
         elif self.help and self.help.show:
-            if char == 27 or char == 104:
+            if char == 27 or chr(char) == 'q' or chr(char) == 'Q':
                 self.help.toggle()
                 self.make_display()
-        elif self.help and char == 104:
+        elif self.help and (chr(char) == 'h' or chr(char) == 'H'):
             self.help.toggle()
             self.make_display()
         elif State.step is Step.Init or (
                 State.step is Step.Apply and self.fatal):
-            if chr(char) == 'q':
+            if chr(char) == 'q' or chr(char) == 'Q':
                 self.set_exit()
         elif State.step is Step.Apply and self.apply_step > 3:
             if self.probe:
@@ -1901,7 +2030,7 @@ if __name__ == "__main__":
         print(f'InfraSonar appliance toolkit version {__version__}')
         sys.exit(0)
 
-    if args.development or 1:  # TODO: rm or
+    if args.development:
         State.api_url = 'https://devapi.infrasonar.com'
         State.hub_host = 'devhub.infrasonar.com'
     else:
