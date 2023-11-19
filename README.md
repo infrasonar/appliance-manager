@@ -6,7 +6,7 @@
 
 This tool can be used to install and manage an InfraSonar appliance.
 
-Before using this tool, make sure docker compose is installed. See also: https://docs.docker.com/compose/install/
+> Before using this tool, make sure docker compose is installed. See also: https://docs.docker.com/compose/install/
 
 
 Installation:
@@ -16,9 +16,7 @@ pip install infrasonar-appliance
 ```
 
 
-Usage:
-
-Just start the tool:
+Usage: _(Just start the tool)_
 ```
 appliance
 ```
