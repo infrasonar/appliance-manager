@@ -6,7 +6,10 @@
 
 This tool can be used to install and manage an [InfraSonar appliance](https://docs.infrasonar.com/collectors/probes/appliance/).
 
-> Before using this tool, make sure docker compose is installed. See also: https://docs.docker.com/compose/install/ or use the following command: `sudo curl -sSL https://get.docker.com | bash`.
+> Before using this tool, make sure docker compose is installed.
+> See also: https://docs.docker.com/compose/install/ or use the following command:
+>
+> `sudo curl -sSL https://get.docker.com | bash`
 
 
 Installation:
