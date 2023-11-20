@@ -6,14 +6,15 @@
 
 This tool can be used to install and manage an [InfraSonar appliance](https://docs.infrasonar.com/collectors/probes/appliance/).
 
-> Before using this tool, make sure docker compose is installed.
-> See also: https://docs.docker.com/compose/install/ or use the following command:
+> To install this tool, Python _(curl and pip for the installtion)_ is required and can be installed using:
+>
+> `sudo apt install python curl pip`
+> 
+> The appliance also requires docker compose:
 >
 > `sudo curl -sSL https://get.docker.com | bash`
 >
-> Besides docker, Python _(and pip for the installtion)_ are required and can be installed using:
->
-> `sudo apt install pip`
+> See also: https://docs.docker.com/compose/install/ or use the following command:
 
 Installation:
 
