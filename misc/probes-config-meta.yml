@@ -1,4 +1,4 @@
-# InfraSonar - probes configuration meta data
+# InfraSonar - probes configuration meta data (.CONST.PROBES_CONFIG_META_YML)
 x-env-basic: &envbasic
   environment:
   - list: LOG_LEVEL
@@ -103,9 +103,6 @@ hypervguest:
 mssql:
   << : *wmi
 
-vcenter:
-  << : *wmi
-
 mysql:
   << : *envbasic
   config:
@@ -125,6 +122,12 @@ santricity:
   - str: password
 
 esx:
+  << : *envbasic
+  config:
+  - str: username
+  - str: password
+
+vcenter: &vcenter
   << : *envbasic
   config:
   - str: username
