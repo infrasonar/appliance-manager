@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.1'
+__version__ = '0.1.2'
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -344,7 +344,7 @@ class State:
                 conf = ConfigObj(fn)
                 cls.agentcore_token = conf['AGENTCORE_TOKEN']
                 cls.agent_token = conf['AGENT_TOKEN']
-                cls.agentcore_zone_id = int(conf['AGENTCORE_ZONE_ID'])
+                cls.agentcore_zone_id = int(conf.get('AGENTCORE_ZONE_ID', 0))
 
             except Exception as e:
                 msg = str(e) or type(e).__name__
