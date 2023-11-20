@@ -10,7 +10,10 @@ This tool can be used to install and manage an [InfraSonar appliance](https://do
 > See also: https://docs.docker.com/compose/install/ or use the following command:
 >
 > `sudo curl -sSL https://get.docker.com | bash`
-
+>
+> Besides docker, Python _(and pip for the installtion)_ are required and can be installed using:
+>
+> `sudo apt install pip`
 
 Installation:
 
