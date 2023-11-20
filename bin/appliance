@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.2'
+__version__ = '0.1.3'
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -27,6 +27,7 @@ _RE_COMPOSE_PATH = \
     re.compile(r'infrasonar\s+([a-z]+).*\s+(\/.*)docker-compose\.yml')
 _RE_RUNNING_PROBE = \
     re.compile(r'^infrasonar-([a-z0-9_]+)-probe-1.*$')
+_RE_COLOR = re.compile(r'\^\[\[[0-9][[0-9]?m')
 _MIN_DOCKER_VERSION = 24
 
 _X_INFRASONAR_TEMPLATE = {
@@ -836,6 +837,9 @@ class LogView:
                 line = await self.process.stderr.readline()
                 if line:
                     line = line.decode()
+
+                    # remove colors as this is not supported
+                    line = _RE_COLOR.sub('', line)
                     self.lines.append(line)
                 else:
                     break
