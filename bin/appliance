@@ -85,6 +85,7 @@ _AGENTS = {
     'speedtest': _SPEEDTEST_AGENT,
 }
 
+
 def eq(left, right):
     return left == right
 
