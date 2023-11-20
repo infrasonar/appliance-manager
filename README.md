@@ -38,7 +38,7 @@ Once installed, simply start the tool using the following command:
 appliance
 ```
 
-The tool will handle the installation and management of your InfraSonar appliance, allowing you to focus on monitoring and managing your IT infrastructure.
+The tool will handle the installation and management of your [InfraSonar appliance](https://docs.infrasonar.com/collectors/probes/appliance/), allowing you to focus on monitoring and managing your IT infrastructure.
 
 ## Additional Notes
 
