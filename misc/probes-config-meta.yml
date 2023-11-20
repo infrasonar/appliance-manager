@@ -103,6 +103,9 @@ hypervguest:
 mssql:
   << : *wmi
 
+vcenter:
+  << : *wmi
+
 mysql:
   << : *envbasic
   config:
@@ -121,14 +124,11 @@ santricity:
   - str: username
   - str: password
 
-vcenter: &vcenter
+esx:
   << : *envbasic
   config:
   - str: username
   - str: password
-
-esx:
-  << : *vcenter
 
 vmwareguest:
   << : *vcenter

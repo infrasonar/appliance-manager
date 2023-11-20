@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.4'
+__version__ = '0.1.5'
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -1838,7 +1838,11 @@ class InfraSonarDisplay:
 
             use = State.config_data.get(self.probe, {}).get('use')
             if not use:
-                State.config_data[self.probe]['config']
+                if State.config_data[self.probe].get('config') is None:
+                    config = {}
+                    ensure_config_defaults(config, meta_cnf)
+                    State.config_data[self.probe]['config'] = config
+
                 inputs.extend(self.generate_input_items(
                     meta_cnf,
                     self.probe,
