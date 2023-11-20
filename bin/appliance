@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -84,9 +84,6 @@ _AGENTS = {
     'docker': _DOCKER_AGENT,
     'speedtest': _SPEEDTEST_AGENT,
 }
-
-_PROBE_IMAGE = 'ghcr.io/infrasonar/{collector_key}-probe'
-
 
 def eq(left, right):
     return left == right
@@ -169,6 +166,15 @@ class State:
     container_id: Optional[int] = None
     has_changes: bool = False
     running_probes: set = set()
+
+    @classmethod
+    def get_probe_tag(cls, probe: str):
+        pdata = cls.compose_data['services'].get(f'{probe}-probe', {})
+        imagestr = pdata.get('image', '')
+        if 'probe:' in imagestr:
+            tag = imagestr.split('probe:')[1]
+            return 'stable' if tag == 'latest' else tag
+        return 'stable'
 
     @classmethod
     def headers(cls):
@@ -1772,6 +1778,35 @@ class InfraSonarDisplay:
         if self.confirm:
             self.confirm.draw()
 
+    def on_select_branch(self, branch: str):
+        current = State.get_probe_tag(self.probe)
+        if current != branch:
+            State.has_changes = True
+            if branch == 'stable':
+                tag = ''
+            else:
+                tag = f':{branch}'
+
+            p = State.compose_data['services'][f'{self.probe}-probe']
+            p['image'] = f'ghcr.io/infrasonar/{self.probe}-probe{tag}'
+        self.to_probe()
+
+    def on_choose_branch(self, branch: str):
+        options = [
+            'stable',
+            'unstable'
+        ]
+        if branch not in options:
+            options.append(branch)
+        self.input_dialog = InputList(
+            self.stdscr,
+            'Choose branch: (be careful with unstable)',
+            self.on_select_branch,
+            self.to_probe,
+            options=options,
+            selected=branch)
+        asyncio.ensure_future(self.async_make_display())
+
     def on_manage_probe_display(self):
         maxy, maxx = self.stdscr.getmaxyx()
         meta = State.probes_config_meta
@@ -1842,6 +1877,12 @@ class InfraSonarDisplay:
                 'Save and apply changes',
                 self.save_and_apply_changes))
 
+        branch = State.get_probe_tag(self.probe)
+        items.append(MenuItem(
+            f'Choose branch (current: {branch})',
+            functools.partial(self.on_choose_branch, branch)
+        ))
+
         idx = self.probe_menu.idx if self.probe_menu else len(items)
 
         if self.probe in State.running_probes:
@@ -1884,7 +1925,8 @@ class InfraSonarDisplay:
             "InfraSonar container will become available here, and disabled "
             "probes will be removed.",
             "A probe marked with (!) requires configuration that is "
-            "currently missing."
+            "currently missing.",
+            "A probe marked with (~) is not on the stable branch."
         ]
 
         if self.help is None:
@@ -1899,10 +1941,16 @@ class InfraSonarDisplay:
         idx = self.probes_menu.idx if self.probes_menu else 0
         items = []
         for probe in State.get_probes():
+            warn = ''
             required = State.probes_config_meta.get(probe, {}).get('config')
             probe_cnf = State.config_data.get(probe, {})
             conf_or_use = probe_cnf.get('config') or probe_cnf.get('use')
-            warn = ' (!)' if required and not conf_or_use else ''
+            if required and not conf_or_use:
+                warn += '!'
+            if State.get_probe_tag(probe) != 'stable':
+                warn += '~'
+            if warn:
+                warn = f' ({warn})'
             items.append(MenuItem(
                 f'{probe}{warn}',
                 functools.partial(self.on_manage_probe, probe)

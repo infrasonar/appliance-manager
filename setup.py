@@ -17,7 +17,7 @@ except IOError:
 
 setup(
     name='infrasonar-appliance',
-    version='0.1.0',  # Update version in appliance as well
+    version='0.1.1',  # Update version in appliance as well
     description='InfraSonar Appliance Manager',
     url='https://github.com/infrasonar/appliance-manager',
     long_description=long_description,
