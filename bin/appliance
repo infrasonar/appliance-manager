@@ -27,7 +27,7 @@ _RE_COMPOSE_PATH = \
     re.compile(r'infrasonar\s+([a-z]+).*\s+(\/.*)docker-compose\.yml')
 _RE_RUNNING_PROBE = \
     re.compile(r'^infrasonar-([a-z0-9_]+)-probe-1.*$')
-_RE_COLOR = re.compile(r'\^\[\[[0-9][0-9]?m')
+_RE_COLOR = re.compile(r'\x1b\[[0-9][0-9]?m')
 _MIN_DOCKER_VERSION = 24
 
 _X_INFRASONAR_TEMPLATE = {
