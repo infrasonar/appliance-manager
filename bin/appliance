@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.5'
+__version__ = '0.1.6'
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -906,6 +906,7 @@ class InfraSonarDisplay:
         self.agents_menu: Optional[Menu] = None
         self.probe: Optional[str] = None
         self.apply_step = 1
+        self.skip_write = False
         self.done: bool = False
         self.warning: str = None
         self._spin: Optional(Pos) = None
@@ -1517,10 +1518,19 @@ class InfraSonarDisplay:
 
     def save_and_apply_changes(self):
         self.apply_step = 1
+        self.skip_write = False
         State.step = Step.Apply
         self.main_menu: Optional[Menu] = None
         asyncio.ensure_future(self.async_make_display())
         asyncio.ensure_future(self.write_to_disk())
+
+    def on_update(self):
+        self.apply_step = 2
+        self.skip_write = True
+        State.step = Step.Apply
+        self.main_menu: Optional[Menu] = None
+        asyncio.ensure_future(self.async_make_display())
+        asyncio.ensure_future(self.docker_compose_pull())
 
     def draw_apply(self):
         self.add_header()
@@ -1528,10 +1538,13 @@ class InfraSonarDisplay:
         self.stdscr.addstr(
             y, 4, "(Each step might take several minutes, please be patient!)")
 
-        y += 2
-        self.stdscr.addstr(y, 4, "write changes to disk........")
+        y += 1
+        if not self.skip_write:
+            y += 1
+            self.stdscr.addstr(y, 4, "write changes to disk........")
         if self.apply_step > 1:
-            self.stdscr.addstr(y, x, "OK")
+            if not self.skip_write:
+                self.stdscr.addstr(y, x, "OK")
             y += 1
             self.stdscr.addstr(y, 4, "docker compose pull..........")
         if self.apply_step > 2:
@@ -1625,6 +1638,7 @@ class InfraSonarDisplay:
                 self.on_change_zone),
             None,
         ]
+
         if State.has_changes:
             items.extend([
                 MenuItem(
@@ -1635,9 +1649,12 @@ class InfraSonarDisplay:
                     self.on_exit_without_saving),
             ])
         else:
-            items.append(
-                MenuItem('Exit', self.set_exit)
-            )
+            items.extend([
+                MenuItem(
+                    'Pull and update',
+                    self.on_update),
+                MenuItem('Exit', self.set_exit),
+            ])
 
         self.main_menu = Menu(
             self.stdscr, Pos(6, 4), items, horizontal=False, ljust=30, idx=idx)
