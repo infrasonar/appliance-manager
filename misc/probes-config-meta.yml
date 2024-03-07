@@ -85,6 +85,9 @@ synology:
 unify:
   << : *snmp
 
+readynas:
+  << : *snmp
+
 wmi: &wmi
   << : *envbasic
   config:
