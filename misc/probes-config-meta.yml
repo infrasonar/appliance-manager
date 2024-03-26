@@ -79,13 +79,13 @@ hpprocurve:
 idrac:
   << : *snmp
 
+readynas:
+  << : *snmp
+
 synology:
   << : *snmp
 
-unify:
-  << : *snmp
-
-readynas:
+unifi:
   << : *snmp
 
 wmi: &wmi
@@ -158,6 +158,9 @@ unificontroller: &unificontroller
   config:
   - str: username
   - str: password
+
+unifisite: &unifisite
+  << : *unificontroller
 
 unifidevice:
   << : *unificontroller
