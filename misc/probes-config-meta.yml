@@ -165,17 +165,6 @@ unifisite: &unifisite
 unifidevice:
   << : *unificontroller
 
-proxmoxnode:
-  << : *envbasic
-  config:
-  - str: username
-  - str: realm
-    default: pam
-  - str: token_id
-  - str: secret
-  help: |
-  Use a token UUID as secret, for example: 12345678-1234-1234-1234-1234567890ab
-
 proxmoxcluster: &proxmoxcluster
   << : *envbasic
   config:
@@ -186,6 +175,9 @@ proxmoxcluster: &proxmoxcluster
   - str: secret
   help: |
   Use a token UUID as secret, for example: 12345678-1234-1234-1234-1234567890ab
+
+proxmoxnode:
+  << : *proxmoxcluster
 
 proxmoxguest:
   << : *proxmoxcluster
