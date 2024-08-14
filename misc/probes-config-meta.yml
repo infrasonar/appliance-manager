@@ -181,3 +181,6 @@ proxmoxnode:
 
 proxmoxguest:
   << : *proxmoxcluster
+
+ipflownetwork:
+  << : *envbasic
