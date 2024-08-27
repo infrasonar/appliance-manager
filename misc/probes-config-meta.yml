@@ -183,4 +183,19 @@ proxmoxguest:
   << : *proxmoxcluster
 
 ipflownetwork:
+  environment:
+  - list: LOG_LEVEL
+    options:
+    - "debug"
+    - "info"
+    - "warning"
+    - "error"
+    - "critical"
+    default: "warning"
+  - int: LISTEN_PORT
+    min: 1
+    max: 65535
+    default: 2055
+
+phpfpm:
   << : *envbasic
