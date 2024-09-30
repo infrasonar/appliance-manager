@@ -4,8 +4,8 @@ locan installation: pip install -e .
 Upload to PyPI
 
 python setup.py sdist
-twine upload --repository pypitest dist/infrasonar-appliance-X.X.X.tar.gz
-twine upload --repository pypi dist/infrasonar-appliance-X.X.X.tar.gz
+twine upload --repository pypitest dist/infrasonar_appliance-X.X.X.tar.gz
+twine upload --repository pypi dist/infrasonar_appliance-X.X.X.tar.gz
 """
 from setuptools import setup, find_packages
 
