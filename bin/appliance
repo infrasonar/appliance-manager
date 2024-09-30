@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.6'
+__version__ = '0.1.7'
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -153,7 +153,7 @@ class Part(Enum):
 
 
 class State:
-    loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+    loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
     probes_config_meta: Optional[dict] = None
     api_url: str
     hub_host: str
@@ -1036,6 +1036,20 @@ class InfraSonarDisplay:
             secret = False
             dval = data.get('default', '')
             text = _get_val_helper(probe, part, section, key, dval)
+        regex = data.get('re')
+
+        def validate(_: str) -> bool:
+            return True
+
+        if regex:
+            try:
+                rx = re.compile(regex)
+            except Exception:
+                pass
+            else:
+                def validate(s: str) -> bool:
+                    return rx.match(s) is not None
+
         return InputStr(
             self.stdscr,
             title,
@@ -1043,7 +1057,7 @@ class InfraSonarDisplay:
                 self.confirm_probe_input,
                 probe, part, section, key),
             self.to_probe,
-            lambda _: True,
+            validate,
             text,
             PRINTABLE_CHARS,
             secret=secret)

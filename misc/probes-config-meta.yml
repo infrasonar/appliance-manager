@@ -174,7 +174,7 @@ proxmoxcluster: &proxmoxcluster
   - str: token_id
   - str: secret
   help: |
-  Use a token UUID as secret, for example: 12345678-1234-1234-1234-1234567890ab
+    Use a token UUID as secret, for example: 12345678-1234-1234-1234-1234567890ab
 
 proxmoxnode:
   << : *proxmoxcluster
@@ -183,6 +183,25 @@ proxmoxguest:
   << : *proxmoxcluster
 
 ipflownetwork:
+  environment:
+  - list: LOG_LEVEL
+    options:
+    - "debug"
+    - "info"
+    - "warning"
+    - "error"
+    - "critical"
+    default: "warning"
+  - int: LISTEN_PORT
+    min: 1
+    max: 65535
+    default: 2055
+  - str: FORWARD_PORTS
+  help: |
+    Use FORWARD_PORTS to send the UDP traffic to one or more ports.
+    Multiple ports must be comma separated.
+
+ipflow:
   environment:
   - list: LOG_LEVEL
     options:
