@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.7'
+__version__ = '0.1.8'
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -1020,6 +1020,9 @@ class InfraSonarDisplay:
             d = State.compose_data['services'][probe_key]
             if d.get('environment') is None:
                 d['environment'] = {}
+            else:
+                # ensure a copy so it will not be shared
+                d['environment'] = d['environment'].copy()
             d = d['environment']
 
         if value != d.get(key):
