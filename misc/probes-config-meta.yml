@@ -196,6 +196,7 @@ ipflownetwork:
     re: "^\\d{1,5}$"
     default: "2055"
   - str: FORWARD_PORTS
+    re: "^((\\d{1,5})(,\\d{1,5})*)?$"
   help: |
     Use FORWARD_PORTS to send the UDP traffic to one or more ports.
     Multiple ports must be comma separated.
@@ -210,10 +211,9 @@ ipflow:
     - "error"
     - "critical"
     default: "warning"
-  - int: LISTEN_PORT
-    min: 1
-    max: 65535
-    default: 2055
+  - str: LISTEN_PORT
+    re: "^\\d{1,5}$"
+    default: "2055"
 
 phpfpm:
   << : *envbasic
