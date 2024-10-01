@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.8'
+__version__ = '0.1.9'  # Update version in setup.py as well
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -493,6 +493,9 @@ class InputStr(Input):
                  validate: callable, text: str, charset: set,
                  max_len: int = 60, secret: bool = False):
         super().__init__(stdscr, title, confirm, cancel)
+        if not isinstance(text, str):
+            text = str(text)
+
         self.secret = secret
         self.hide = secret
         self.text = text
@@ -572,6 +575,12 @@ class InputInt(Input):
     def __init__(self, stdscr, title: str, confirm: callable, cancel: callable,
                  number: int, mi: int, ma: int):
         super().__init__(stdscr, title, confirm, cancel)
+        if not isinstance(number, int):
+            try:
+                number = int(number)
+            except Exception:
+                number = 0
+
         self.number = number
         self.mi = mi
         self.ma = ma
