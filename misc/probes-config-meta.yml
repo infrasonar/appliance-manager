@@ -67,6 +67,9 @@ snmp: &snmp
 apcups:
   << : *snmp
 
+brocade:
+  << : *snmp
+
 eaton:
   << : *snmp
 
