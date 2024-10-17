@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.1.9'  # Update version in setup.py as well
+__version__ = '0.2.0'  # Update version in setup.py as well
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -36,6 +36,15 @@ _X_INFRASONAR_TEMPLATE = {
     'network_mode': 'host',
     'restart': 'always',
     'volumes': ['./data:/data/']
+}
+
+_SOCAT = {
+    'image': 'alpine/socat',
+    'command': 'tcp-l:443,fork,reuseaddr tcp:${SOCAT_TARGET_ADDR}:443',
+    'expose': [443],
+    'restart': 'always',
+    'logging': {'options': {'max-size': '5m'}},
+    'network_mode': 'host'
 }
 
 _WATCH_TOWER = {
@@ -108,6 +117,10 @@ def read_docker_version(output):
 
 PRINTABLE_CHARS = set([ord(c) for c in string.printable])
 TOKEN_CHARS = set([ord(c) for c in '0123456789abcdef'])
+SOCAT_TARGET_CHARS = set([ord(c) for c in (
+    '.0123456789'
+    'abcdefghijklmnopqrstuvwxyz'
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ')])
 TOKEN_LEN = 32
 
 
@@ -165,6 +178,7 @@ class State:
     agentcore_token: Optional[str] = None
     agent_token: Optional[str] = None
     agentcore_zone_id: Optional[int] = None
+    socat_target_addr: Optional[str] = None
     container_id: Optional[int] = None
     has_changes: bool = False
     running_probes: set = set()
@@ -247,6 +261,7 @@ class State:
             conf['AGENTCORE_TOKEN'] = cls.agentcore_token
             conf['AGENT_TOKEN'] = cls.agent_token
             conf['AGENTCORE_ZONE_ID'] = cls.agentcore_zone_id
+            conf['SOCAT_TARGET_ADDR'] = cls.socat_target_addr or ''
             conf.write()
         except Exception as e:
             msg = str(e) or type(e).__name__
@@ -346,6 +361,7 @@ class State:
                 cls.agentcore_token = conf['AGENTCORE_TOKEN']
                 cls.agent_token = conf['AGENT_TOKEN']
                 cls.agentcore_zone_id = int(conf.get('AGENTCORE_ZONE_ID', 0))
+                cls.socat_target_addr = conf.get('SOCAT_TARGET_ADDR', '')
 
             except Exception as e:
                 msg = str(e) or type(e).__name__
@@ -1292,6 +1308,21 @@ class InfraSonarDisplay:
             self.main_menu = None
         self.to_main()
 
+    def set_socat_target_addr(self, socat_target_addr: str):
+        if socat_target_addr != State.socat_target_addr:
+            State.socat_target_addr = socat_target_addr
+            services = State.compose_data['services']
+            if socat_target_addr:
+                services['socat'] = _SOCAT
+            else:
+                try:
+                    del services['socat']
+                except KeyError:
+                    pass
+            State.has_changes = True
+            self.main_menu = None
+        self.to_main()
+
     def to_main(self):
         self.probe = None
         self.help: Optional[Help] = None
@@ -1371,6 +1402,17 @@ class InfraSonarDisplay:
             State.agentcore_zone_id,
             0,
             9)
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_api_forwarder(self):
+        self.input_dialog = InputStr(
+            self.stdscr,
+            'InfraSonar API target address (empty for disable)',
+            self.set_socat_target_addr,
+            self.to_main,
+            lambda _: True,
+            State.socat_target_addr,
+            charset=SOCAT_TARGET_CHARS)
         asyncio.ensure_future(self.async_make_display())
 
     def on_install_done(self, zone_id: Optional[int] = None):
@@ -1662,6 +1704,9 @@ class InfraSonarDisplay:
             MenuItem(
                 'Change zone',
                 self.on_change_zone),
+            MenuItem(
+                'Configure API forwarder',
+                self.on_api_forwarder),
             None,
         ]
 
