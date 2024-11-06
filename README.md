@@ -44,3 +44,19 @@ The tool will handle the installation and management of your [InfraSonar applian
 
 - For more detailed instructions and troubleshooting guidance, refer to the official [InfraSonar documentation](https://docs.infrasonar.com).
 - If you encounter any issues during installation or usage, feel free to [contact](https://infrasonar.com/contact) the InfraSonar support team for assistance.
+
+## API forwarding
+
+To enable InfraSonar agents to communicate with the API when direct access is blocked by firewalls, this tool can establish a forwarding service. This service acts as an intermediary, relaying agent requests to the API.
+
+If you encounter issues binding to port 443 due to insufficient Docker privileges, you can adjust the system settings using the following command:
+
+```
+sudo sysctl net.ipv4.ip_unprivileged_port_start=0
+```
+
+To keep this setting after reboot, create or edit `/etc/sysctl.d/local.conf` and add the following line:
+
+```
+net.ipv4.ip_unprivileged_port_start=0
+```
