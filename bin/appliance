@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.2.0'  # Update version in setup.py as well
+__version__ = '0.2.1'  # Update version in setup.py as well
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -872,14 +872,18 @@ class LogView:
             pass
 
     def stop(self):
-        if self.process:
-            try:
-                self.process.kill()
-            except Exception:
-                pass
         if self.future:
             try:
                 self.future.cancel()
+            except Exception:
+                pass
+        if self.process:
+            try:
+                self.process.kill()
+
+                # below is a fix for Python 3.12 (for some reason close is not
+                # reached on the transport after calling kill or terminatre)
+                self.process._transport.close()
             except Exception:
                 pass
         self.future = None
@@ -1639,6 +1643,9 @@ class InfraSonarDisplay:
         self.stdscr.addstr(maxy - 2, maxx - 20, "Press 'q' to quit")
         self.stdscr.refresh()
 
+        # Ensure condif_data
+        State.config_data = {}
+
         if self.fatal:
             self.fatal.draw()
         else:
@@ -2187,3 +2194,5 @@ if __name__ == "__main__":
     _DOCKER_AGENT['environment']['API_URI'] = State.api_url
 
     curses.wrapper(main)
+
+
