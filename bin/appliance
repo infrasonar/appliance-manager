@@ -2194,5 +2194,3 @@ if __name__ == "__main__":
     _DOCKER_AGENT['environment']['API_URI'] = State.api_url
 
     curses.wrapper(main)
-
-
