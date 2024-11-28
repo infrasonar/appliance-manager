@@ -9,6 +9,8 @@ twine upload --repository pypi dist/infrasonar-appliance-X.X.X.tar.gz
 """
 from setuptools import setup, find_packages
 
+__version__ = '0.2.2'  # Update version in appliance/appliance.py as well
+
 try:
     with open('README.md', 'r') as f:
         long_description = f.read()
@@ -17,14 +19,16 @@ except IOError:
 
 setup(
     name='infrasonar-appliance',
-    version='0.2.1',  # Update version in appliance as well
+    version=__version__,
     description='InfraSonar Appliance Manager',
     url='https://github.com/infrasonar/appliance-manager',
     long_description=long_description,
     long_description_content_type='text/markdown',
     author='Jeroen van der Heijden',
     author_email='jeroen@cesbit.com',
-    scripts=['bin/appliance'],
+    entry_points = {
+        'console_scripts': ['appliance=appliance.appliance:main'],
+    },
     license='GPLv3',
     classifiers=[
         # How mature is this project? Common values are
@@ -46,6 +50,7 @@ setup(
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
     ],
     install_requires=[
         'aiohttp',
