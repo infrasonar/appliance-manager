@@ -26,7 +26,7 @@ setup(
     long_description_content_type='text/markdown',
     author='Jeroen van der Heijden',
     author_email='jeroen@cesbit.com',
-    entry_points = {
+    entry_points={
         'console_scripts': ['appliance=appliance.appliance:main'],
     },
     license='GPLv3',
