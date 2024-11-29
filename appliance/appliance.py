@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.2.1'  # Update version in setup.py as well
+__version__ = '0.2.2'  # Update version in setup.py as well
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -2157,12 +2157,12 @@ async def display_main(stdscr):
     await disp.run()
 
 
-def main(stdscr) -> None:
+def start(stdscr) -> None:
     # add signal handlers
     return State.loop.run_until_complete(display_main(stdscr))
 
 
-if __name__ == "__main__":
+def main():
     os.environ.setdefault('ESCDELAY', '25')
     setproctitle('appliance-manager')
 
@@ -2193,4 +2193,8 @@ if __name__ == "__main__":
     _SPEEDTEST_AGENT['environment']['API_URI'] = State.api_url
     _DOCKER_AGENT['environment']['API_URI'] = State.api_url
 
-    curses.wrapper(main)
+    curses.wrapper(start)
+
+
+if __name__ == '__main__':
+    main()
