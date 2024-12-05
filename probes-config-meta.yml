@@ -34,6 +34,7 @@ snmp: &snmp
   config:
   - list: version
     options:
+    - "1"
     - "2c"
     - "3"
     default: "2c"
