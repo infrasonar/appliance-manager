@@ -9,6 +9,10 @@ x-env-basic: &envbasic
     - "error"
     - "critical"
     default: "warning"
+  - int: LOG_COLORIZED
+    min: 0
+    max: 1
+    default: 0
 
 x-env-advanced: &envadvanced
   environment:
@@ -28,6 +32,10 @@ x-env-advanced: &envadvanced
     - "error"
     - "critical"
     default: "warning"
+  - int: LOG_COLORIZED
+    min: 0
+    max: 1
+    default: 0
 
 snmp: &snmp
   << : *envbasic
@@ -199,6 +207,10 @@ ipflownetwork:
     - "error"
     - "critical"
     default: "warning"
+  - int: LOG_COLORIZED
+    min: 0
+    max: 1
+    default: 0
   - str: LISTEN_PORT
     re: "^\\d{1,5}$"
     default: "2055"
@@ -221,6 +233,10 @@ ipflow:
   - str: LISTEN_PORT
     re: "^\\d{1,5}$"
     default: "2055"
+  - int: LOG_COLORIZED
+    min: 0
+    max: 1
+    default: 0
 
 phpfpm:
   << : *envbasic
