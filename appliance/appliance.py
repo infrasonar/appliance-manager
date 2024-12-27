@@ -97,8 +97,7 @@ _AGENTS = {
 
 _RAPP = {
     'image': 'ghcr.io/infrasonar/rapp',
-    'volumes': ['./:/docker/', './data/config:/config/']
-
+    'volumes': ['./:/docker/', './data/config:/config/'],
 }
 
 def eq(left, right):
@@ -2271,6 +2270,7 @@ def main():
     if args.development:
         State.api_url = 'https://devapi.infrasonar.com'
         State.hub_host = 'devhub.infrasonar.com'
+        _RAPP['environment'] = {'USE_DEVELOPMENT': 1}
     else:
         State.api_url = 'https://api.infrasonar.com'
         State.hub_host = 'hub.infrasonar.com'
