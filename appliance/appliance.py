@@ -96,7 +96,9 @@ _AGENTS = {
 }
 
 _RAPP = {
-    'image': 'ghcr.io/infrasonar/rapp'
+    'image': 'ghcr.io/infrasonar/rapp',
+    'volumes': ['./:/docker/', './data/config:/config/']
+
 }
 
 def eq(left, right):
