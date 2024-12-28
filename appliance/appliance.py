@@ -95,13 +95,31 @@ _AGENTS = {
     'speedtest': _SPEEDTEST_AGENT,
 }
 
-_RAPP = {
-    'image': 'ghcr.io/infrasonar/rapp',
-    'volumes': [
-        './:/docker/',
-        './data/config:/config/',
-        '/var/run/docker.sock:/var/run/docker.sock'],
-}
+USE_DEVELOPMENT = 0
+
+
+def get_rapp(compose_path: str, use_development: bool) -> dict:
+    COMPOSE_FILE = \
+        os.path.join(compose_path, 'docker-compose.yml')
+    CONFIG_FILE = \
+        os.path.join(compose_path, 'data', 'config', 'infrasonar.yaml')
+    ENV_FILE = \
+        os.path.join(compose_path, '.env')
+
+    return {
+        'image': 'ghcr.io/infrasonar/rapp',
+        'environment': {
+            'USE_DEVELOPMENT': use_development,
+            'COMPOSE_FILE': COMPOSE_FILE,
+            'CONFIG_FILE': CONFIG_FILE,
+            'ENV_FILE': ENV_FILE,
+        },
+        'volumes': [
+            f'{compose_path}:{compose_path}',
+            '/var/run/docker.sock:/var/run/docker.sock'
+        ],
+    }
+
 
 def eq(left, right):
     return left == right
@@ -347,7 +365,7 @@ class State:
                     except Exception:
                         pass
                     else:
-                        cls.compose_path = p
+                        cls.compose_path = os.path.abspath(p)
                         cls.status = 'not running'
                         break
                 else:
@@ -1502,7 +1520,7 @@ class InfraSonarDisplay:
 
     def on_install_agentcore_token(self, path: Optional[str] = None):
         if path is not None:
-            State.compose_path = path
+            State.compose_path = os.path.abspath(path)
 
         self.input_dialog = InputStr(
             self.stdscr,
@@ -1827,7 +1845,7 @@ class InfraSonarDisplay:
     def do_install_rapp(self):
         State.has_changes = True
         d = State.compose_data['x-infrasonar-template'].copy()
-        d.update(_RAPP)
+        d.update(get_rapp(State.compose_path, USE_DEVELOPMENT))
         State.compose_data['services']['rapp'] = d
         self.to_rapp()
 
@@ -1848,7 +1866,7 @@ class InfraSonarDisplay:
         self.confirm = Confirm(
             self.stdscr,
             'Are you sure you want to remove the remote appliance (RAPP)?',
-            self.do_remove_agent,
+            self.do_remove_rapp,
             self.to_rapp)
         asyncio.ensure_future(self.async_make_display())
 
@@ -2273,7 +2291,7 @@ def main():
     if args.development:
         State.api_url = 'https://devapi.infrasonar.com'
         State.hub_host = 'devhub.infrasonar.com'
-        _RAPP['environment'] = {'USE_DEVELOPMENT': 1}
+        USE_DEVELOPMENT = 1
     else:
         State.api_url = 'https://api.infrasonar.com'
         State.hub_host = 'hub.infrasonar.com'
