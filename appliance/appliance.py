@@ -2258,6 +2258,7 @@ class InfraSonarDisplay:
         elif State.step is Step.Rapp:
             self.rapp_menu.handle_char(char)
 
+
 async def display_main(stdscr):
     disp = InfraSonarDisplay(stdscr)
     await disp.run()
