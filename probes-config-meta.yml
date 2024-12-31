@@ -47,6 +47,7 @@ snmp: &snmp
     - "3"
     default: "2c"
   - section: community
+    if: config.version!=3
     items:
     - str: secret
       default: public
