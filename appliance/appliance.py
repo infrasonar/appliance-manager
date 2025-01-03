@@ -2290,6 +2290,7 @@ def main():
         sys.exit(0)
 
     if args.development:
+        global USE_DEVELOPMENT
         State.api_url = 'https://devapi.infrasonar.com'
         State.hub_host = 'devhub.infrasonar.com'
         USE_DEVELOPMENT = 1
