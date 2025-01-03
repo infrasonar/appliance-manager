@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 from aiohttp import ClientSession
 
 
-__version__ = '0.2.2'  # Update version in setup.py as well
+__version__ = '0.3.0'  # Update version in setup.py as well
 
 _RE_DOCKER_VERSION = \
     re.compile(r'Docker version ([0-9]+)\.([0-9]+)\.([0-9]+).*')
@@ -95,6 +95,31 @@ _AGENTS = {
     'speedtest': _SPEEDTEST_AGENT,
 }
 
+USE_DEVELOPMENT = 0
+
+
+def get_rapp(compose_path: str, use_development: bool) -> dict:
+    COMPOSE_FILE = \
+        os.path.join(compose_path, 'docker-compose.yml')
+    CONFIG_FILE = \
+        os.path.join(compose_path, 'data', 'config', 'infrasonar.yaml')
+    ENV_FILE = \
+        os.path.join(compose_path, '.env')
+
+    return {
+        'image': 'ghcr.io/infrasonar/rapp',
+        'environment': {
+            'USE_DEVELOPMENT': use_development,
+            'COMPOSE_FILE': COMPOSE_FILE,
+            'CONFIG_FILE': CONFIG_FILE,
+            'ENV_FILE': ENV_FILE,
+        },
+        'volumes': [
+            f'{compose_path}:{compose_path}',
+            '/var/run/docker.sock:/var/run/docker.sock'
+        ],
+    }
+
 
 def eq(left, right):
     return left == right
@@ -156,8 +181,9 @@ class Step(Enum):
     Synchronize = 4
     ManageProbe = 5
     ManageAgents = 6
-    ViewLogs = 7
-    Install = 8
+    Rapp = 7
+    ViewLogs = 8
+    Install = 9
 
 
 class Part(Enum):
@@ -273,7 +299,7 @@ class State:
                 fp.write(r"""
 ## InfraSonar docker-compose.yml file
 ##
-## !! This file is managed with the InfraSonar appliance toolkit. !!
+## !! This file is managed by InfraSonar !!
 
 """.lstrip())
                 yaml.safe_dump(cls.compose_data, fp)
@@ -305,7 +331,7 @@ class State:
 ##        username: bob
 ##        password: "my secret"
 ##
-## !! This file is managed with the InfraSonar appliance toolkit. !!
+## !! This file is managed by InfraSonar !!
 ##
 ## It's okay to add custom probe configuration for when you want to
 ## specify the "_use" value for assets. The appliance toolktip will not
@@ -339,7 +365,7 @@ class State:
                     except Exception:
                         pass
                     else:
-                        cls.compose_path = p
+                        cls.compose_path = os.path.abspath(p)
                         cls.status = 'not running'
                         break
                 else:
@@ -933,6 +959,7 @@ class InfraSonarDisplay:
         self.probes_menu: Optional[Menu] = None
         self.probe_menu: Optional[Menu] = None
         self.agents_menu: Optional[Menu] = None
+        self.rapp_menu: Optional[Menu] = None
         self.probe: Optional[str] = None
         self.apply_step = 1
         self.skip_write = False
@@ -1336,6 +1363,7 @@ class InfraSonarDisplay:
         self.probes_menu: Optional[Menu] = None
         self.probe_menu: Optional[Menu] = None
         self.agents_menu: Optional[Menu] = None
+        self.rapp_menu: Optional[Menu] = None
         self.apply_step = None
         curses.curs_set(0)
         State.step = Step.Main
@@ -1357,6 +1385,13 @@ class InfraSonarDisplay:
         self.help: Optional[Help] = None
         self.confirm: Optional[Confirm] = None
         State.step = Step.ManageAgents
+        curses.curs_set(0)
+        asyncio.ensure_future(self.async_make_display())
+
+    def to_rapp(self):
+        self.help: Optional[Help] = None
+        self.confirm: Optional[Confirm] = None
+        State.step = Step.Rapp
         curses.curs_set(0)
         asyncio.ensure_future(self.async_make_display())
 
@@ -1485,7 +1520,7 @@ class InfraSonarDisplay:
 
     def on_install_agentcore_token(self, path: Optional[str] = None):
         if path is not None:
-            State.compose_path = path
+            State.compose_path = os.path.abspath(path)
 
         self.input_dialog = InputStr(
             self.stdscr,
@@ -1525,6 +1560,11 @@ class InfraSonarDisplay:
     def on_manage_agents(self):
         self.help: Optional[Help] = None
         State.step = Step.ManageAgents
+        asyncio.ensure_future(self.async_make_display())
+
+    def on_rapp(self):
+        self.help: Optional[Help] = None
+        State.step = Step.Rapp
         asyncio.ensure_future(self.async_make_display())
 
     def on_view_logs(self):
@@ -1714,6 +1754,9 @@ class InfraSonarDisplay:
             MenuItem(
                 'Configure API forwarder',
                 self.on_api_forwarder),
+            MenuItem(
+                'Remote appliance',
+                self.on_rapp),
             None,
         ]
 
@@ -1799,6 +1842,34 @@ class InfraSonarDisplay:
             self.to_agents)
         asyncio.ensure_future(self.async_make_display())
 
+    def do_install_rapp(self):
+        State.has_changes = True
+        d = State.compose_data['x-infrasonar-template'].copy()
+        d.update(get_rapp(State.compose_path, USE_DEVELOPMENT))
+        State.compose_data['services']['rapp'] = d
+        self.to_rapp()
+
+    def on_install_rapp(self):
+        self.confirm = Confirm(
+            self.stdscr,
+            'Are you sure you want to install the remote appliance (RAPP)?',
+            self.do_install_rapp,
+            self.to_rapp)
+        asyncio.ensure_future(self.async_make_display())
+
+    def do_remove_rapp(self):
+        State.has_changes = True
+        State.compose_data['services'].pop('rapp', None)
+        self.to_rapp()
+
+    def on_remove_rapp(self):
+        self.confirm = Confirm(
+            self.stdscr,
+            'Are you sure you want to remove the remote appliance (RAPP)?',
+            self.do_remove_rapp,
+            self.to_rapp)
+        asyncio.ensure_future(self.async_make_display())
+
     async def on_view_logs_display(self):
         numlines = -1
         while State.step is Step.ViewLogs:
@@ -1868,6 +1939,38 @@ class InfraSonarDisplay:
 
         idx = self.agents_menu.idx if self.agents_menu else 0
         self.agents_menu = Menu(
+            self.stdscr,
+            Pos(6, 4),
+            items,
+            horizontal=False,
+            ljust=30,
+            idx=idx)
+
+        if self.confirm:
+            self.confirm.draw()
+
+    def on_rapp_display(self):
+        self.add_header()
+        items = []
+        if State.compose_data['services'].get('rapp') is None:
+            items.append(MenuItem(
+                'Install Remote Appliance (RAPP)',
+                self.on_install_rapp
+            ))
+        else:
+            items.append(MenuItem(
+                'Remove Remote Appliance (RAPP)',
+                self.on_remove_rapp
+            ))
+
+        items.append(None)
+        items.append(MenuItem(
+            'Back to main',
+            self.to_main
+        ))
+
+        idx = self.rapp_menu.idx if self.rapp_menu else 0
+        self.rapp_menu = Menu(
             self.stdscr,
             Pos(6, 4),
             items,
@@ -2110,6 +2213,8 @@ class InfraSonarDisplay:
             self.on_manage_probe_display()
         elif State.step is Step.ManageAgents:
             self.on_manage_agents_display()
+        elif State.step is Step.Rapp:
+            self.on_rapp_display()
         elif State.step is Step.ViewLogs:
             self.logview.redraw = True
             self.logview.viewport = None
@@ -2150,6 +2255,8 @@ class InfraSonarDisplay:
             self.probe_menu.handle_char(char)
         elif State.step is Step.ManageAgents:
             self.agents_menu.handle_char(char)
+        elif State.step is Step.Rapp:
+            self.rapp_menu.handle_char(char)
 
 
 async def display_main(stdscr):
@@ -2183,8 +2290,10 @@ def main():
         sys.exit(0)
 
     if args.development:
+        global USE_DEVELOPMENT
         State.api_url = 'https://devapi.infrasonar.com'
         State.hub_host = 'devhub.infrasonar.com'
+        USE_DEVELOPMENT = 1
     else:
         State.api_url = 'https://api.infrasonar.com'
         State.hub_host = 'hub.infrasonar.com'

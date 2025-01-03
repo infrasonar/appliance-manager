@@ -9,7 +9,7 @@ twine upload --repository pypi dist/infrasonar-appliance-X.X.X.tar.gz
 """
 from setuptools import setup, find_packages
 
-__version__ = '0.2.2'  # Update version in appliance/appliance.py as well
+__version__ = '0.3.0'  # Update version in appliance/appliance.py as well
 
 try:
     with open('README.md', 'r') as f:
