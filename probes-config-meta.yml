@@ -169,6 +169,12 @@ ping:
 http:
   << : *envbasic
 
+tcp:
+  << : *envbasic
+
+dns:
+  << : *envbasic
+
 unificontroller: &unificontroller
   << : *envbasic
   config:
