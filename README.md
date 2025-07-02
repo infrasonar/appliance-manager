@@ -1,7 +1,7 @@
 [![CI](https://github.com/infrasonar/appliance-manager/workflows/CI/badge.svg)](https://github.com/infrasonar/appliance-manager/actions)
 [![Release Version](https://img.shields.io/github/release/infrasonar/appliance-manager)](https://github.com/infrasonar/appliance-manager/releases)
 
-| :exclamation:  DEPRECATED: Use the appliance installer instead: https://github.com/infrasonar/appliance-installer   |
+| :exclamation:  DEPRECATED: Use the [appliance installer](https://github.com/infrasonar/appliance-installer) instead |
 |-----------------------------------------|
     
 
